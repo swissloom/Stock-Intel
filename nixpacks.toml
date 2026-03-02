@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python310"]
+
+[phases.install]
+cmds = ["cd server && pip install -r requirements.txt"]
+
+[start]
+cmd = "cd server && python3 server.py"
