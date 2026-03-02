@@ -1,5 +1,5 @@
-// Yahoo Finance via local Python backend
-const BACKEND_URL = 'http://localhost:5000';
+// Yahoo Finance via Railway backend
+const BACKEND_URL = 'https://stock-intel-production.up.railway.app';
 
 const STOCK_DATA = {
   Technology: [
