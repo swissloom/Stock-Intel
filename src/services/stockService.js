@@ -1,5 +1,7 @@
-// Yahoo Finance via Render backend
+// Direct Finnhub API calls (no backend needed)
 const BACKEND_URL = 'https://stock-intel-srht.onrender.com';
+const FINNHUB_API_KEY = 'd6hdsc9r01qnjncoai80d6hdsc9r01qnjncoai8g';
+const USE_DIRECT_API = true; // Set to false to use backend
 
 const STOCK_DATA = {
   Technology: [
@@ -39,6 +41,62 @@ const TICKERS = Object.values(STOCK_DATA).flat();
 
 // Fetch stock data from local backend
 const fetchYahooFinanceData = async () => {
+  // Try direct Finnhub API first (faster, more reliable)
+  if (USE_DIRECT_API) {
+    try {
+      console.log('Fetching directly from Finnhub API...');
+      const priority_tickers = [
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B',
+        'JPM', 'V', 'JNJ', 'WMT', 'PG', 'MA', 'HD', 'BAC', 'XOM', 'CVX',
+        'ABBV', 'PFE', 'KO', 'PEP', 'COST', 'MRK', 'AVGO', 'ORCL', 'CSCO',
+        'SPY', 'QQQ', 'VOO', 'ASML', 'SHOP', 'NFLX', 'ADBE', 'CRM'
+      ];
+      
+      const fetchStock = async (ticker) => {
+        try {
+          const quoteRes = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
+          const quote = await quoteRes.json();
+          
+          if (!quote.c) return null;
+          
+          const profileRes = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
+          const profile = await profileRes.json();
+          
+          return {
+            ticker,
+            name: profile.name || ticker,
+            price: quote.c,
+            marketCap: (profile.marketCapitalization || 0) / 1000,
+            pegRatio: 1.5,
+            priceChange6m: quote.dp || 0, // Use daily change as proxy
+            priceHistory: [],
+            sector: profile.finnhubIndustry || 'Unknown',
+            beta: 1.0,
+            ma200: null,
+          };
+        } catch (e) {
+          console.error(`Error fetching ${ticker}:`, e);
+          return null;
+        }
+      };
+      
+      // Fetch in batches of 5 to respect rate limits
+      const results = [];
+      for (let i = 0; i < priority_tickers.length; i += 5) {
+        const batch = priority_tickers.slice(i, i + 5);
+        const batchResults = await Promise.all(batch.map(fetchStock));
+        results.push(...batchResults.filter(r => r !== null));
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second between batches
+      }
+      
+      console.log(`Fetched ${results.length} stocks from Finnhub`);
+      return results;
+    } catch (error) {
+      console.error('Direct API failed, trying backend...', error);
+    }
+  }
+  
+  // Fallback to backend
   try {
     const response = await fetch(`${BACKEND_URL}/api/stocks`);
 
