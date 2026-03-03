@@ -56,12 +56,26 @@ def get_stocks():
     
     if USE_FINNHUB:
         print("Using Finnhub API for accurate real-time prices...")
-        # Use Finnhub for most accurate real-time data
-        for ticker in tickers:
-            data = get_stock_data_finnhub(ticker)
-            if data:
-                stocks_data.append(data)
-            time.sleep(0.1)  # Small delay to respect rate limits
+        # Use parallel processing for much faster loading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def fetch_stock(ticker):
+            try:
+                data = get_stock_data_finnhub(ticker)
+                time.sleep(0.02)  # Small delay to respect rate limits (60/min = 1 per second, but we can batch)
+                return data
+            except Exception as e:
+                print(f"Error fetching {ticker}: {e}")
+                return None
+        
+        # Fetch stocks in parallel (10 at a time for speed while respecting rate limits)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(fetch_stock, ticker): ticker for ticker in tickers}
+            for future in as_completed(futures):
+                data = future.result()
+                if data:
+                    stocks_data.append(data)
+        
         return jsonify(stocks_data)
     elif USE_ALPHA_VANTAGE:
         print("Using Alpha Vantage API for accurate prices...")

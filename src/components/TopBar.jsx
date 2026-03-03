@@ -1,6 +1,41 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 
 const TopBar = ({ searchQuery, setSearchQuery, viewMode, setViewMode, activeView }) => {
+  const [marketStatus, setMarketStatus] = useState({ isOpen: false, status: 'Closed' });
+
+  useEffect(() => {
+    const checkMarketStatus = () => {
+      const now = new Date();
+      const nyTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const day = nyTime.getDay(); // 0 = Sunday, 6 = Saturday
+      const hours = nyTime.getHours();
+      const minutes = nyTime.getMinutes();
+      const timeInMinutes = hours * 60 + minutes;
+      
+      // Market hours: Monday-Friday, 9:30 AM - 4:00 PM ET
+      const marketOpen = 9 * 60 + 30; // 9:30 AM
+      const marketClose = 16 * 60; // 4:00 PM
+      
+      const isWeekday = day >= 1 && day <= 5;
+      const isDuringMarketHours = timeInMinutes >= marketOpen && timeInMinutes < marketClose;
+      
+      if (isWeekday && isDuringMarketHours) {
+        setMarketStatus({ isOpen: true, status: 'Open' });
+      } else if (isWeekday && timeInMinutes >= marketClose) {
+        setMarketStatus({ isOpen: false, status: 'Closed' });
+      } else if (isWeekday && timeInMinutes < marketOpen) {
+        setMarketStatus({ isOpen: false, status: 'Pre-Market' });
+      } else {
+        setMarketStatus({ isOpen: false, status: 'Closed' });
+      }
+    };
+
+    checkMarketStatus();
+    const interval = setInterval(checkMarketStatus, 60000); // Check every minute
+
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <div className="p-4">
       <div className="glass-panel glass-shadow rounded-2xl px-6 py-4">
@@ -44,8 +79,10 @@ const TopBar = ({ searchQuery, setSearchQuery, viewMode, setViewMode, activeView
           )}
           
           <div className="text-white text-sm">
-            <span className="text-gray-400">Market Status:</span>
-            <span className="ml-2 text-green-400">● Open</span>
+            <span className="text-gray-400">US Market:</span>
+            <span className={`ml-2 ${marketStatus.isOpen ? 'text-green-400' : 'text-red-400'}`}>
+              ● {marketStatus.status}
+            </span>
           </div>
         </div>
       </div>
