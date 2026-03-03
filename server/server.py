@@ -52,30 +52,39 @@ def get_stocks():
         'BRK-B'
     ]
     
+    # Limit to top 30 stocks for free tier performance
+    priority_tickers = [
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B',
+        'JPM', 'V', 'JNJ', 'WMT', 'PG', 'MA', 'HD', 'BAC', 'XOM', 'CVX',
+        'ABBV', 'PFE', 'KO', 'PEP', 'COST', 'MRK', 'AVGO', 'ORCL', 'CSCO',
+        'SPY', 'QQQ', 'VOO'
+    ]
+    
     stocks_data = []
     
     if USE_FINNHUB:
-        print("Using Finnhub API for accurate real-time prices...")
+        print(f"Using Finnhub API for {len(priority_tickers)} stocks...")
         # Use parallel processing for much faster loading
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
         def fetch_stock(ticker):
             try:
                 data = get_stock_data_finnhub(ticker)
-                time.sleep(0.02)  # Small delay to respect rate limits (60/min = 1 per second, but we can batch)
+                time.sleep(0.02)  # Small delay to respect rate limits
                 return data
             except Exception as e:
                 print(f"Error fetching {ticker}: {e}")
                 return None
         
-        # Fetch stocks in parallel (10 at a time for speed while respecting rate limits)
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(fetch_stock, ticker): ticker for ticker in tickers}
+        # Fetch stocks in parallel (5 at a time to avoid timeout on free tier)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(fetch_stock, ticker): ticker for ticker in priority_tickers}
             for future in as_completed(futures):
                 data = future.result()
                 if data:
                     stocks_data.append(data)
         
+        print(f"Successfully fetched {len(stocks_data)} stocks")
         return jsonify(stocks_data)
     elif USE_ALPHA_VANTAGE:
         print("Using Alpha Vantage API for accurate prices...")
