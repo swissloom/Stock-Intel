@@ -1,5 +1,5 @@
-// Yahoo Finance via Railway backend
-const BACKEND_URL = 'https://stock-intel-production.up.railway.app';
+// Yahoo Finance via Render backend
+const BACKEND_URL = 'https://stock-intel-srht.onrender.com';
 
 const STOCK_DATA = {
   Technology: [
