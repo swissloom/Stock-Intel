@@ -16,10 +16,14 @@ import pytest
 from src.data_fetcher import DataFetchError, normalize_ohlcv, fetch_market_data
 from src.optimizer import walk_forward_optimize
 from src.risk_engine import (
+    PROFIT_FACTOR_NO_LOSS,
+    cagr_pct,
     calculate_metrics,
+    compute_trade_stats,
     dynamic_slippage,
     regime_filter,
     simulate_latency,
+    total_return_pct,
 )
 from src.strategies import apply_strategy
 
@@ -341,7 +345,12 @@ def test_walk_forward_optimize_stop_loss_affects_pnl():
     close = np.maximum(close, 10.0)  # keep prices positive
     df = _ohlcv_from_close(close)
 
-    tight, _ = walk_forward_optimize(
+    # Use the opt-in details channel to read the realized per-config metrics
+    # from the sweep. This proves the stop-loss level materially changes the
+    # realized P&L path even when the profitability guardrail (Total Return
+    # <= 0 => UNPROFITABLE, never selected) prevents a losing config from
+    # becoming best_config.
+    _, _, tight_details = walk_forward_optimize(
         df,
         ticker="VOL",
         strategy_names=["Momentum"],
@@ -351,8 +360,9 @@ def test_walk_forward_optimize_stop_loss_affects_pnl():
         latency_base_delay=0.0,
         latency_jitter=0.0,
         max_drawdown_limit=1.0,
+        return_details=True,
     )
-    loose, _ = walk_forward_optimize(
+    _, _, loose_details = walk_forward_optimize(
         df,
         ticker="VOL",
         strategy_names=["Momentum"],
@@ -362,11 +372,16 @@ def test_walk_forward_optimize_stop_loss_affects_pnl():
         latency_base_delay=0.0,
         latency_jitter=0.0,
         max_drawdown_limit=1.0,
+        return_details=True,
     )
-    assert tight is not None and loose is not None
+    tight_sweep = tight_details["sweep"]
+    loose_sweep = loose_details["sweep"]
+    assert tight_sweep and loose_sweep
     # The stop-loss level is applied to the return path, so a very tight stop
-    # and a very loose stop should not yield identical Sharpe values.
-    assert tight["sharpe"] != loose["sharpe"]
+    # and a very loose stop should not yield identical realized Sharpe values.
+    assert tight_sweep[0]["sharpe"] != loose_sweep[0]["sharpe"]
+    # And they produce materially different total returns too.
+    assert tight_sweep[0]["total_return_pct"] != loose_sweep[0]["total_return_pct"]
 
 
 # ---------------------------------------------------------------------------
@@ -440,3 +455,282 @@ def test_fetch_market_data_retries_on_rate_limit():
     )
     assert calls["n"] == 2
     assert "Close" in out.columns
+
+
+# ---------------------------------------------------------------------------
+# risk_engine: trade stats / total return / CAGR (institutional metrics)
+# ---------------------------------------------------------------------------
+def test_compute_trade_stats_known_signal_and_returns():
+    # Signal: two trades. Trade 1 bars [1,2] (held, exits at index 3),
+    # trade 2 bars [5,6] (held, exits at index 7).
+    #   index:   0  1  2  3  4  5  6  7  8
+    #   signal:  0  1  1  0  0  1  1  0  0
+    signal = pd.Series([0, 1, 1, 0, 0, 1, 1, 0, 0])
+    # Returns applied per bar. Trade 1 holds bars 1,2 -> 0.02 + 0.03 = 0.05 (win)
+    # Trade 2 holds bars 5,6 -> -0.04 + 0.01 = -0.03 (loss)
+    returns = pd.Series([0.0, 0.02, 0.03, 0.0, 0.0, -0.04, 0.01, 0.0, 0.0])
+    stats = compute_trade_stats(signal, returns)
+    assert stats["total_trades"] == 2
+    # One winner out of two -> 50% win rate.
+    assert stats["win_rate_pct"] == pytest.approx(50.0)
+    # Each trade held 2 bars -> avg duration 2.0.
+    assert stats["avg_trade_duration_days"] == pytest.approx(2.0)
+    assert stats["gross_profit"] == pytest.approx(0.05)
+    assert stats["gross_loss"] == pytest.approx(0.03)
+    # Profit factor = gross profit / gross loss = 0.05 / 0.03.
+    assert stats["profit_factor"] == pytest.approx(0.05 / 0.03)
+
+
+def test_compute_trade_stats_zero_trades_defaults():
+    signal = pd.Series([0, 0, 0, 0])
+    returns = pd.Series([0.01, -0.01, 0.0, 0.02])
+    stats = compute_trade_stats(signal, returns)
+    assert stats["total_trades"] == 0
+    assert stats["win_rate_pct"] == 0.0
+    assert stats["avg_trade_duration_days"] == 0.0
+    assert stats["profit_factor"] == 0.0
+
+
+def test_compute_trade_stats_zero_loss_sentinel():
+    # A single winning trade with no losing trades -> documented sentinel.
+    signal = pd.Series([0, 1, 1, 0])
+    returns = pd.Series([0.0, 0.02, 0.03, 0.0])
+    stats = compute_trade_stats(signal, returns)
+    assert stats["total_trades"] == 1
+    assert stats["win_rate_pct"] == pytest.approx(100.0)
+    assert stats["profit_factor"] == PROFIT_FACTOR_NO_LOSS
+
+
+def test_compute_trade_stats_exit_at_end_of_series():
+    # Still long at the end: trade spans bars [2, 4].
+    signal = pd.Series([0, 0, 1, 1, 1])
+    returns = pd.Series([0.0, 0.0, 0.01, 0.01, 0.01])
+    stats = compute_trade_stats(signal, returns)
+    assert stats["total_trades"] == 1
+    assert stats["avg_trade_duration_days"] == pytest.approx(3.0)
+    assert stats["gross_profit"] == pytest.approx(0.03)
+
+
+def test_total_return_pct_additive():
+    returns = pd.Series([0.01, 0.02, -0.01])
+    # Additive convention: sum * 100 = (0.02) * 100 = 2.0.
+    assert total_return_pct(returns) == pytest.approx(2.0)
+
+
+def test_cagr_pct_hand_computed():
+    # Total return 20% over 126 periods (half a year of trading days).
+    # CAGR = ((1.2) ** (252/126) - 1) * 100 = (1.2**2 - 1) * 100 = 44.0.
+    assert cagr_pct(20.0, 126) == pytest.approx(44.0)
+
+
+def test_cagr_pct_guards():
+    assert cagr_pct(10.0, 0) == 0.0
+    # Total loss beyond -100% -> full wipeout sentinel.
+    assert cagr_pct(-150.0, 252) == -100.0
+
+
+# ---------------------------------------------------------------------------
+# walk_forward_optimize: details channel, guardrail, objective, benchmark
+# ---------------------------------------------------------------------------
+def test_walk_forward_optimize_without_details_keeps_contract(long_uptrend_df):
+    """Regression guard: default call shape and exact 8-key contract hold."""
+    best, equity_curve = walk_forward_optimize(
+        long_uptrend_df,
+        ticker="SYNTH",
+        strategy_names=["Momentum", "Bollinger_Squeeze"],
+        stop_loss_range=[0.05, 0.1],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+    )
+    assert isinstance(best, dict)
+    assert set(best.keys()) == EXPECTED_CONFIG_KEYS
+    assert isinstance(equity_curve, list)
+
+
+def test_walk_forward_optimize_details_structure(long_uptrend_df):
+    best, equity_curve, details = walk_forward_optimize(
+        long_uptrend_df,
+        ticker="SYNTH",
+        strategy_names=["Momentum", "Bollinger_Squeeze"],
+        stop_loss_range=[0.05, 0.1],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        return_details=True,
+    )
+    # best_config still exactly the 8-key contract.
+    assert set(best.keys()) == EXPECTED_CONFIG_KEYS
+    for key in (
+        "total_return_pct",
+        "cagr_pct",
+        "profit_factor",
+        "win_rate_pct",
+        "total_trades",
+        "avg_trade_duration_days",
+        "benchmark_total_return_pct",
+        "benchmark_equity_curve",
+        "latency_ms",
+        "dynamic_slippage_pct",
+        "period_start",
+        "period_end",
+        "sweep",
+        "top10",
+    ):
+        assert key in details, f"missing details key: {key}"
+    # Guardrail: a selected config is profitable.
+    assert details["total_return_pct"] > 0
+    # Benchmark curve is length-aligned with the strategy equity curve.
+    assert len(details["benchmark_equity_curve"]) == len(equity_curve)
+    # Top-10 is truncated and ranked by profit factor desc then sharpe desc.
+    assert len(details["top10"]) <= 10
+    pfs = [(e["profit_factor"], e["sharpe"]) for e in details["top10"]]
+    assert pfs == sorted(pfs, reverse=True)
+
+
+def _const_return_df(per_period_log: float, n: int, start: str, base: float = 100.0):
+    """Build an OHLCV frame whose Close grows so pct_change ~= per_period_log."""
+    idx = pd.bdate_range(start=start, periods=n)
+    close = base * (1.0 + per_period_log) ** np.arange(n)
+    spread = np.maximum(np.abs(close) * 0.01, 0.1)
+    return pd.DataFrame(
+        {
+            "Open": close,
+            "High": close + spread,
+            "Low": close - spread,
+            "Close": close,
+            "Volume": np.full(n, 1_000_000.0),
+        },
+        index=idx,
+    )
+
+
+def test_walk_forward_optimize_unprofitable_never_selected():
+    """A strategy with Total Return <= 0 must be flagged and never selected.
+
+    We construct a falling series so Momentum stays flat (0% strategy return =>
+    unprofitable under the guardrail of ``<= 0``). No profitable config exists,
+    so best_config must be None while the sweep still records the configs.
+    """
+    n = 900
+    close = 800.0 - np.arange(n) * 0.5
+    df = _ohlcv_from_close(close)
+    best, equity_curve, details = walk_forward_optimize(
+        df,
+        ticker="DOWN",
+        strategy_names=["Momentum"],
+        stop_loss_range=[0.05],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        max_drawdown_limit=1.0,
+        return_details=True,
+    )
+    assert best is None
+    assert equity_curve is None
+    # Every tested config was flagged unprofitable (<=0 total return).
+    assert len(details["sweep"]) > 0
+    assert all(e["unprofitable"] for e in details["sweep"])
+
+
+def test_walk_forward_optimize_objective_selects_higher_score(monkeypatch):
+    """Among profitable candidates, the higher (CAGR*PF)/(MDD+1e-5) wins.
+
+    We stub the metric helpers so two strategies produce deterministic,
+    controlled objective scores and assert the optimizer picks the larger.
+    """
+    import src.optimizer as opt
+
+    # Make the loop run exactly one window with two strategies.
+    df = _ohlcv_from_close(100.0 + np.arange(900) * 1.0)
+
+    # Force a favorable regime everywhere and non-trivial signals.
+    monkeypatch.setattr(
+        opt, "regime_filter", lambda data: pd.Series(True, index=data.index)
+    )
+
+    def fake_apply(data, strategy):
+        out = data.copy()
+        out["Signal"] = 1
+        return out
+
+    monkeypatch.setattr(opt, "apply_strategy", fake_apply)
+
+    # Both profitable, same drawdown; StratB has higher CAGR*PF => should win.
+    def fake_calc(returns, risk_free_rate=0.0):
+        return 1.0, 1.0, 0.1  # sharpe, sortino, mdd
+
+    monkeypatch.setattr(opt, "calculate_metrics", fake_calc)
+    monkeypatch.setattr(opt, "total_return_pct", lambda r: 10.0)  # profitable
+    # StratA cagr 10, StratB cagr 30 (same PF via compute_trade_stats stub).
+    cagr_by_call = {"n": 0}
+
+    def fake_cagr(total_ret_pct, n_periods):
+        cagr_by_call["n"] += 1
+        return 10.0 if cagr_by_call["n"] == 1 else 30.0
+
+    monkeypatch.setattr(opt, "cagr_pct", fake_cagr)
+    monkeypatch.setattr(
+        opt,
+        "compute_trade_stats",
+        lambda sig, rets: {
+            "total_trades": 1,
+            "win_rate_pct": 100.0,
+            "avg_trade_duration_days": 1.0,
+            "gross_profit": 1.0,
+            "gross_loss": 0.0,
+            "profit_factor": 2.0,
+        },
+    )
+
+    best, _, details = walk_forward_optimize(
+        df,
+        ticker="OBJ",
+        strategy_names=["StratA", "StratB"],
+        stop_loss_range=[0.05],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        return_details=True,
+    )
+    assert best is not None
+    # StratB had the higher CAGR and thus higher objective.
+    assert best["strategy"] == "StratB"
+
+
+def test_run_walk_forward_details_opt_in(long_uptrend_df):
+    from src.optimizer import run_walk_forward
+
+    result = run_walk_forward(
+        ticker="SYNTH",
+        strategy_names=["Momentum", "Bollinger_Squeeze"],
+        stop_loss_range=[0.05, 0.1],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        data=long_uptrend_df,
+        return_equity_curve=True,
+        return_details=True,
+    )
+    assert len(result) == 3
+    best, equity_curve, details = result
+    assert set(best.keys()) == EXPECTED_CONFIG_KEYS
+    assert "top10" in details and "sweep" in details
+
+    # Default contract unchanged: scalar dict by default.
+    best_only = run_walk_forward(
+        ticker="SYNTH",
+        strategy_names=["Momentum"],
+        stop_loss_range=[0.05],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        data=long_uptrend_df,
+    )
+    assert best_only is None or set(best_only.keys()) == EXPECTED_CONFIG_KEYS

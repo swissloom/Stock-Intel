@@ -72,6 +72,151 @@ def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0):
     return sharpe, sortino, max_drawdown
 
 
+# Sentinel returned by :func:`compute_trade_stats` for profit factor when there
+# are winning trades but zero losing trades (division by zero). A large finite
+# value keeps downstream arithmetic (ranking / objective) well-defined while
+# still signalling "no losses". Documented here so callers/tests can rely on it.
+PROFIT_FACTOR_NO_LOSS = 1.0e9
+
+
+def compute_trade_stats(signal: pd.Series, period_returns: pd.Series) -> dict:
+    """Compute trade-level statistics from a signal and its realized returns.
+
+    Trades are derived from ``signal`` transitions where ``signal`` is the
+    per-bar position (1 = long, 0 = flat):
+
+    * a ``0 -> 1`` transition is an **entry**;
+    * the matching ``1 -> 0`` transition (or the end of the series while still
+      long) is the **exit**.
+
+    The per-trade P&L is the **sum of the realized per-period returns** while
+    the position is held. This is consistent with the optimizer's equity curve,
+    which is built additively (``returns.cumsum()``), so a trade's contribution
+    equals the additive change in the equity curve over its holding window.
+
+    Parameters
+    ----------
+    signal:
+        Per-bar position series (values in ``{0, 1}``).
+    period_returns:
+        Per-bar realized strategy returns aligned with ``signal`` (already net
+        of slippage / stop-loss clipping / regime masking). ``NaN`` values are
+        treated as ``0.0``.
+
+    Returns
+    -------
+    dict
+        ``total_trades`` (int), ``win_rate_pct`` (float, winning / total * 100),
+        ``avg_trade_duration_days`` (float, mean bars held per trade),
+        ``gross_profit`` (float, sum of positive trade P&L),
+        ``gross_loss`` (float, absolute sum of negative trade P&L),
+        ``profit_factor`` (float).
+
+    Edge cases
+    ----------
+    * **Zero trades** -> ``win_rate_pct=0.0``, ``avg_trade_duration_days=0.0``,
+      ``gross_profit=0.0``, ``gross_loss=0.0``, ``profit_factor=0.0``.
+    * **Zero losses but >0 trades** -> ``profit_factor`` is the documented
+      sentinel :data:`PROFIT_FACTOR_NO_LOSS` (``1e9``).
+    """
+    sig = pd.Series(signal).fillna(0.0).astype(float).reset_index(drop=True)
+    rets = pd.Series(period_returns).fillna(0.0).astype(float).reset_index(drop=True)
+    n = min(len(sig), len(rets))
+    sig = sig.iloc[:n]
+    rets = rets.iloc[:n]
+
+    # Treat anything > 0.5 as "long" so float signals are handled robustly.
+    pos = (sig > 0.5).to_numpy()
+
+    trade_pnls: list[float] = []
+    trade_durations: list[int] = []
+    in_trade = False
+    entry_i = 0
+    for i in range(n):
+        if pos[i] and not in_trade:
+            in_trade = True
+            entry_i = i
+        elif not pos[i] and in_trade:
+            # Exit at bar i: the position was held for bars [entry_i, i-1].
+            pnl = float(rets.iloc[entry_i:i].sum())
+            trade_pnls.append(pnl)
+            trade_durations.append(i - entry_i)
+            in_trade = False
+    if in_trade:
+        # Still long at the end of the series: close at the last bar.
+        pnl = float(rets.iloc[entry_i:n].sum())
+        trade_pnls.append(pnl)
+        trade_durations.append(n - entry_i)
+
+    total_trades = len(trade_pnls)
+    if total_trades == 0:
+        return {
+            "total_trades": 0,
+            "win_rate_pct": 0.0,
+            "avg_trade_duration_days": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "profit_factor": 0.0,
+        }
+
+    wins = [p for p in trade_pnls if p > 0]
+    losses = [p for p in trade_pnls if p < 0]
+    gross_profit = float(sum(wins))
+    gross_loss = float(abs(sum(losses)))
+    win_rate_pct = len(wins) / total_trades * 100.0
+    avg_trade_duration_days = float(np.mean(trade_durations))
+
+    if gross_loss > 1e-12:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 1e-12:
+        profit_factor = PROFIT_FACTOR_NO_LOSS
+    else:
+        # Trades exist but net zero gross profit and zero gross loss.
+        profit_factor = 0.0
+
+    return {
+        "total_trades": total_trades,
+        "win_rate_pct": win_rate_pct,
+        "avg_trade_duration_days": avg_trade_duration_days,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": profit_factor,
+    }
+
+
+def total_return_pct(period_returns: pd.Series) -> float:
+    """Total return (%) using the **additive** convention.
+
+    Consistent with the optimizer's equity curve (``returns.cumsum()``), total
+    return is the sum of per-period returns expressed as a percentage:
+    ``sum(returns) * 100``. ``NaN`` values are treated as ``0.0``.
+    """
+    rets = pd.Series(period_returns).fillna(0.0).astype(float)
+    return float(rets.sum() * 100.0)
+
+
+def cagr_pct(total_ret_pct: float, n_periods: int) -> float:
+    """Annualized return (CAGR %) from a total return % and a period count.
+
+    ``CAGR = ((1 + total_return) ** (252 / n_periods) - 1) * 100`` where
+    ``total_return`` is the fractional total return (``total_ret_pct / 100``)
+    and 252 is the trading-days-per-year convention.
+
+    Guards
+    ------
+    * ``n_periods <= 0`` -> returns ``0.0``.
+    * ``1 + total_return <= 0`` (total loss of 100%+ ) -> returns ``-100.0``
+      (a full wipeout) since the fractional power is otherwise undefined.
+    """
+    if n_periods <= 0:
+        return 0.0
+    total_ret = total_ret_pct / 100.0
+    base = 1.0 + total_ret
+    if base <= 0:
+        return -100.0
+    return float((base ** (252.0 / n_periods) - 1.0) * 100.0)
+
+
 def dynamic_slippage(volatility: float, base_slippage: float = 0.001) -> float:
     """Dynamically scale transaction costs based on underlying volatility.
 
