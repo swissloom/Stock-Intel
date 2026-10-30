@@ -1,6 +1,6 @@
 """Self-contained HTML dashboard generator.
 
-Renders a single, dependency-free ``output/dashboard.html`` report using
+Renders a single, dependency-free ``output/index.html`` report using
 jinja2. The report summarises the optimal strategy configuration, the
 Sharpe/Sortino/drawdown metrics, dynamic cost (slippage) and latency logs, the
 stop-loss rule, and an inline SVG equity curve. No external CDN or JavaScript is
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from jinja2 import Environment
 
 DEFAULT_OUTPUT_DIR = "output"
-DEFAULT_OUTPUT_FILE = "dashboard.html"
+DEFAULT_OUTPUT_FILE = "index.html"
 
 _TEMPLATE = """<!DOCTYPE html>
 <html lang="en">

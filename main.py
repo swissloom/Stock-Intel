@@ -9,7 +9,7 @@ preserved with a single source of truth:
 
 Running ``python main.py`` loads ``config/settings.yaml`` (falling back to the
 spec defaults), performs a live walk-forward optimization for AAPL and renders a
-self-contained HTML dashboard to ``output/dashboard.html``.
+self-contained HTML dashboard to ``output/index.html``.
 """
 
 from __future__ import annotations
