@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Put the repository root on sys.path so the ``src`` package is importable
+# when running ``pytest tests/`` from the repo root (the way CI invokes it).
+# ``python main.py`` works because running a script adds the repo root to
+# sys.path, but pytest does not, so we configure it explicitly here.
+pythonpath = ["."]
+testpaths = ["tests"]
