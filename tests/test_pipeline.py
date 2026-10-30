@@ -734,3 +734,158 @@ def test_run_walk_forward_details_opt_in(long_uptrend_df):
         data=long_uptrend_df,
     )
     assert best_only is None or set(best_only.keys()) == EXPECTED_CONFIG_KEYS
+
+
+# ---------------------------------------------------------------------------
+# dashboard_generator: self-contained HTML rendering (offline)
+# ---------------------------------------------------------------------------
+def _synthetic_details() -> dict:
+    """A deterministic details payload mimicking the optimizer's opt-in channel."""
+    sweep = [
+        {
+            "ticker": "SYNTH",
+            "strategy": "Momentum",
+            "stop_loss": 0.05,
+            "sharpe": 1.42,
+            "sortino": 2.01,
+            "max_drawdown": 0.12,
+            "total_return_pct": 34.5,
+            "cagr_pct": 18.2,
+            "profit_factor": 2.6,
+            "win_rate_pct": 61.0,
+            "total_trades": 14,
+            "avg_trade_duration_days": 7.3,
+            "unprofitable": False,
+            "objective": 10.0,
+        },
+        {
+            "ticker": "SYNTH",
+            "strategy": "Bollinger_Squeeze",
+            "stop_loss": 0.08,
+            "sharpe": -0.4,
+            "sortino": -0.3,
+            "max_drawdown": 0.22,
+            "total_return_pct": -5.1,
+            "cagr_pct": -3.0,
+            "profit_factor": 0.7,
+            "win_rate_pct": 40.0,
+            "total_trades": 9,
+            "avg_trade_duration_days": 4.0,
+            "unprofitable": True,
+            "objective": 0.0,
+        },
+    ]
+    return {
+        "total_return_pct": 34.5,
+        "cagr_pct": 18.2,
+        "profit_factor": 2.6,
+        "win_rate_pct": 61.0,
+        "total_trades": 14,
+        "avg_trade_duration_days": 7.3,
+        "benchmark_total_return_pct": 22.0,
+        "benchmark_equity_curve": [0.0, 0.05, 0.10, 0.18, 0.22],
+        "latency_ms": 150.0,
+        "dynamic_slippage_pct": 0.1234,
+        "period_start": "2020-01-01",
+        "period_end": "2026-10-30",
+        "objective": 10.0,
+        "sweep": sweep,
+        "top10": sweep,
+    }
+
+
+def _best_config() -> dict:
+    return {
+        "ticker": "SYNTH",
+        "strategy": "Momentum",
+        "stop_loss": 0.05,
+        "sharpe": 1.42,
+        "sortino": 2.01,
+        "max_drawdown": 0.12,
+        "execution_delay_sec": 0.15,
+        "estimated_slippage": 0.001234,
+    }
+
+
+def test_generate_dashboard_renders_all_sections(tmp_path):
+    from src.dashboard_generator import DEFAULT_OUTPUT_FILE, generate_dashboard
+
+    strategy_curve = [0.0, 0.08, 0.15, 0.28, 0.345]
+    details = _synthetic_details()
+    path = generate_dashboard(
+        _best_config(),
+        equity_curve=strategy_curve,
+        output_dir=str(tmp_path),
+        details=details,
+        benchmark_curve=details["benchmark_equity_curve"],
+    )
+    assert path.endswith(DEFAULT_OUTPUT_FILE)  # output name stays index.html
+    assert os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, encoding="utf-8") as fh:
+        html = fh.read()
+
+    # Institutional metrics present.
+    for needle in (
+        "2020-01-01",
+        "2026-10-30",
+        "Total Return",
+        "CAGR",
+        "Benchmark",
+        "Win Rate",
+        "Profit Factor",
+        "Total Trades",
+        "Avg Trade Duration",
+        "Sharpe",
+        "Sortino",
+        "Max Drawdown",
+        "Dynamic slippage",
+        "Latency",
+        "Full Parameter Sweep (Top 10)",
+        "Unprofitable",
+    ):
+        assert needle in html, f"missing dashboard section/metric: {needle}"
+
+    # Both equity series are drawn (two polylines) + a legend distinguishes them.
+    assert html.count("<polyline") == 2
+    assert "Strategy" in html and "Buy &amp; Hold" in html
+
+    # Fully self-contained: no external CDN / script / stylesheet / image refs.
+    assert "http://" not in html
+    assert "https://" not in html
+    assert "<script" not in html
+    assert "src=" not in html
+
+
+def test_generate_dashboard_empty_state_still_renders(tmp_path):
+    from src.dashboard_generator import generate_dashboard
+
+    # No qualifying config, but the sweep/top10 is still populated.
+    details = _synthetic_details()
+    path = generate_dashboard(
+        None,
+        equity_curve=None,
+        output_dir=str(tmp_path),
+        details=details,
+    )
+    assert os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, encoding="utf-8") as fh:
+        html = fh.read()
+    assert "No strategy configuration satisfied the risk constraints." in html
+    # The sweep table still renders in the empty-state branch.
+    assert "Full Parameter Sweep (Top 10)" in html
+    assert "https://" not in html and "<script" not in html
+
+
+def test_generate_dashboard_single_curve_fallback(tmp_path):
+    """Without a benchmark the SVG falls back to a single series (no legend)."""
+    from src.dashboard_generator import generate_dashboard
+
+    path = generate_dashboard(
+        _best_config(),
+        equity_curve=[0.0, 0.1, 0.2, 0.3],
+        output_dir=str(tmp_path),
+    )
+    with open(path, encoding="utf-8") as fh:
+        html = fh.read()
+    assert html.count("<polyline") == 1
+    assert "https://" not in html and "<script" not in html

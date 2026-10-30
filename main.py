@@ -84,7 +84,7 @@ def main() -> int:
     latency = settings.get("latency", _DEFAULTS["latency"])
 
     try:
-        best_config, equity_curve = run_walk_forward(
+        best_config, equity_curve, details = run_walk_forward(
             ticker=settings["ticker"],
             strategy_names=settings["strategies"],
             stop_loss_range=settings["stop_loss_range"],
@@ -99,6 +99,7 @@ def main() -> int:
             latency_base_delay=latency.get("base_delay", 0.1),
             latency_jitter=latency.get("jitter", 0.05),
             return_equity_curve=True,
+            return_details=True,
         )
     except DataFetchError as exc:
         # Graceful handling: a transient Yahoo rate-limit / network failure must
@@ -113,9 +114,22 @@ def main() -> int:
         print(f"[x] Optimization failed: {type(exc).__name__}: {exc}")
         return 1
 
-    # Pass the winning configuration's cumulative-return (equity) curve so the
-    # self-contained dashboard renders the spec-required return curve.
-    dashboard_path = generate_dashboard(best_config, equity_curve=equity_curve)
+    # Pass the winning configuration's cumulative-return (equity) curve plus the
+    # institutional-metrics details (Total Return/CAGR/Profit Factor/Win Rate,
+    # Buy & Hold benchmark return + equity curve, period start/end, latency ms,
+    # dynamic slippage %, and the top-10 sweep) so the self-contained dashboard
+    # renders the full institutional report. latency_ms and dynamic_slippage_pct
+    # are already converted inside the optimizer's details channel
+    # (latency_ms = execution_delay_sec * 1000, dynamic_slippage_pct =
+    # estimated_slippage * 100). The benchmark equity curve is sourced from
+    # details['benchmark_equity_curve'] by generate_dashboard.
+    benchmark_curve = details.get("benchmark_equity_curve") if details else None
+    dashboard_path = generate_dashboard(
+        best_config,
+        equity_curve=equity_curve,
+        details=details,
+        benchmark_curve=benchmark_curve,
+    )
     print(f"[+] Dashboard written to: {dashboard_path}")
     return 0
 
