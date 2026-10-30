@@ -49,12 +49,20 @@ def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0):
     std_dev = returns.std()
     downside_std = downside_returns.std()
 
+    # Guard against degenerate dispersion. A mathematically-constant return
+    # stream can still yield a tiny non-zero std (~1e-18) from floating-point
+    # accumulation, which would otherwise pass a strict ``> 0`` check and blow
+    # up the ratio, so treat anything at or below the float tolerance as zero.
+    _STD_EPS = 1e-12
+
     sharpe = (
-        (excess_returns.mean() / std_dev * np.sqrt(252)) if std_dev > 0 else 0.0
+        (excess_returns.mean() / std_dev * np.sqrt(252))
+        if std_dev > _STD_EPS
+        else 0.0
     )
     sortino = (
         (excess_returns.mean() / downside_std * np.sqrt(252))
-        if downside_std > 0
+        if downside_std > _STD_EPS
         else 0.0
     )
 
