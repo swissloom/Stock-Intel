@@ -66,8 +66,8 @@ jobs:
         # Live Yahoo Finance downloads can intermittently fail with HTTP 429.
         # Guard against publishing a missing/empty artifact.
         run: |
-          if ! test -s output/dashboard.html; then
-            echo "::error::output/dashboard.html is missing or empty; refusing to deploy."
+          if ! test -s output/index.html; then
+            echo "::error::output/index.html is missing or empty; refusing to deploy."
             exit 1
           fi
 

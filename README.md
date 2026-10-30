@@ -73,7 +73,7 @@ python main.py
 
 This reads `config/settings.yaml`, downloads live market data for the configured
 ticker (default **AAPL**), runs the walk-forward optimization, prints the
-`OPTIMIZATION RESULTS` block, and writes `output/dashboard.html`.
+`OPTIMIZATION RESULTS` block, and writes `output/index.html`.
 
 > **Live data vs. offline tests.** `python main.py` fetches live data from
 > Yahoo Finance and therefore requires internet access. Yahoo intermittently
