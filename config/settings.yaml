@@ -1,0 +1,51 @@
+# Stock-Intel quantitative pipeline configuration
+# ------------------------------------------------
+# Central model parameters, asset universe and risk thresholds consumed by
+# main.py and the walk-forward optimizer. Defaults mirror the reference spec.
+
+# Primary ticker used by the default pipeline run.
+ticker: AAPL
+
+# Asset universe (the pipeline optimizes `ticker`; the list documents the
+# broader universe this workstation is intended to cover).
+assets:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - NVDA
+
+# Strategies to sweep during optimization.
+strategies:
+  - Momentum
+  - Bollinger_Squeeze
+
+# Stop-loss levels (fractional adverse move) swept over out-of-sample data.
+stop_loss_range:
+  - 0.02
+  - 0.05
+  - 0.08
+
+# Walk-forward window sizing (in calendar years; converted to 252 trading days).
+train_window_years: 2
+test_window_years: 1
+
+# Historical data range for the live download.
+date_range:
+  start: "2020-01-01"
+  end: "2026-01-01"
+
+# Risk budgeting thresholds.
+risk:
+  # Disqualify any configuration whose max drawdown exceeds this fraction.
+  max_drawdown_limit: 0.25
+  # Per-period risk-free rate used for excess-return / Sharpe calculations.
+  risk_free_rate: 0.0
+
+# Dynamic transaction-cost model: slippage = base_slippage * (1 + 10 * vol).
+base_slippage: 0.001
+
+# Execution-latency simulation (seconds). Kept small for fast pipeline runs.
+latency:
+  base_delay: 0.1
+  jitter: 0.05

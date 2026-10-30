@@ -1,0 +1,38 @@
+name: Quant Pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests (hard gate)
+        env:
+          # Disable real latency sleeps so the suite runs fast.
+          SIMULATE_LATENCY: "0"
+        run: pytest tests/ -v
+
+      - name: Run pipeline (live data; may hit Yahoo rate limits)
+        # Non-blocking: live Yahoo Finance downloads intermittently return
+        # HTTP 429, which must not fail the overall workflow.
+        continue-on-error: true
+        env:
+          SIMULATE_LATENCY: "0"
+        run: python main.py
