@@ -11,8 +11,25 @@ report.
 The pipeline downloads historical OHLCV data, sweeps a set of strategies and
 stop-loss levels across rolling train/test windows (walk-forward), scores each
 configuration by `Sharpe + Sortino`, disqualifies any configuration that breaks
-the max-drawdown limit, and writes the winning configuration to an HTML
-dashboard.
+the max-drawdown limit, and writes the winning configuration (together with its
+cumulative-return / equity curve) to a self-contained HTML dashboard.
+
+### Stop-loss handling
+
+The swept `stop_loss` level is **applied to the realized return path**: within
+each test window, any single-period adverse move worse than `-stop_loss` is
+capped at `-stop_loss` (a simple per-bar stop). This means different stop-loss
+levels produce genuinely different P&L and scored metrics, so the "optimal"
+stop-loss reflects an effect that was actually simulated.
+
+> **Deviation from the bare reference.** The spec's verbatim reference records
+> the stop-loss level but never applies it to the return series, so every
+> stop-loss value would score identically. We intentionally apply the stop to
+> the return path (a per-period clip at `-stop_loss`) so the advertised exit
+> rule matches the backtested P&L. The stop is modeled as a per-bar return
+> floor rather than an intra-bar price trigger; a path-dependent intraday stop
+> (exit mid-bar, flatten the position for the remainder of the window) is a
+> known simplification left as future work.
 
 ## Architecture
 

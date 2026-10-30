@@ -53,7 +53,17 @@ def walk_forward_optimize(
     slippage + simulated latency, scoring ``sharpe + sortino`` and disqualifying
     any configuration whose max drawdown exceeds ``max_drawdown_limit``.
 
-    Returns the best configuration dict (or ``None`` when nothing qualifies).
+    The swept stop-loss level is applied to the per-period return path: any
+    single-period loss worse than ``-sl`` is capped at ``-sl`` (a simple
+    per-bar stop), so different stop-loss levels genuinely change the realized
+    P&L and the scored metrics rather than merely being recorded.
+
+    Returns
+    -------
+    tuple(dict | None, list | None)
+        ``(best_config, equity_curve)`` where ``equity_curve`` is the
+        cumulative-return series (as a list of floats) for the winning
+        configuration, or ``(None, None)`` when nothing qualifies.
     """
     volatility = data["Close"].pct_change().rolling(21).std() * np.sqrt(252)
     regime = regime_filter(data)
@@ -63,6 +73,7 @@ def walk_forward_optimize(
 
     best_overall_score = -np.inf
     best_config = None
+    best_equity_curve = None
 
     for start_idx in range(0, len(data) - train_days - test_days, test_days):
         train_end = start_idx + train_days
@@ -86,6 +97,11 @@ def walk_forward_optimize(
                 returns = test_signals["Signal"] * test_data["Close"].pct_change()
                 returns = returns - slip
 
+                # Apply the swept stop-loss to the realized return path: cap any
+                # single-period adverse move at ``-sl`` so the stop-loss level
+                # actually affects P&L (and therefore the scored metrics).
+                returns = returns.clip(lower=-sl)
+
                 valid_regime = regime.iloc[train_end:test_end]
                 returns = returns * valid_regime.astype(int)
 
@@ -108,8 +124,13 @@ def walk_forward_optimize(
                         "execution_delay_sec": round(delay, 3),
                         "estimated_slippage": round(slip, 5),
                     }
+                    # Retain the winning config's cumulative-return (equity)
+                    # curve so the dashboard can render the return curve.
+                    best_equity_curve = (
+                        returns.fillna(0.0).cumsum().astype(float).tolist()
+                    )
 
-    return best_config
+    return best_config, best_equity_curve
 
 
 def run_walk_forward(
@@ -126,14 +147,18 @@ def run_walk_forward(
     latency_base_delay: float = DEFAULT_LATENCY_BASE_DELAY,
     latency_jitter: float = DEFAULT_LATENCY_JITTER,
     data: pd.DataFrame | None = None,
+    return_equity_curve: bool = False,
 ):
     """Download market data and run the walk-forward optimization pipeline.
 
     Keeps the spec's public signature. A pre-fetched ``data`` frame may be
     injected (bypassing the network) for offline testing.
 
-    Returns the best configuration dict, or ``None`` when no configuration
-    satisfies the risk constraints.
+    By default returns the best configuration dict (or ``None`` when no
+    configuration satisfies the risk constraints), preserving the spec's
+    documented behaviour. When ``return_equity_curve=True`` the function
+    instead returns a ``(best_config, equity_curve)`` tuple so callers (such as
+    the dashboard renderer) can draw the winning configuration's return curve.
     """
     if data is None:
         print(f"[*] Downloading market data for ticker: {ticker}...")
@@ -141,7 +166,7 @@ def run_walk_forward(
 
     print("[*] Initiating Walk-Forward Optimization pipeline...")
 
-    best_config = walk_forward_optimize(
+    best_config, equity_curve = walk_forward_optimize(
         data,
         ticker=ticker,
         strategy_names=strategy_names,
@@ -164,4 +189,6 @@ def run_walk_forward(
         print("No strategy configuration satisfied risk constraints.")
     print("==========================================\n")
 
+    if return_equity_curve:
+        return best_config, equity_curve
     return best_config

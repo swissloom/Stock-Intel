@@ -93,6 +93,21 @@ def uptrend_df() -> pd.DataFrame:
 
 
 @pytest.fixture
+def long_uptrend_df() -> pd.DataFrame:
+    """A rising series long enough to enter the walk-forward loop.
+
+    ``walk_forward_optimize`` iterates
+    ``range(0, len(data) - train_days - test_days, test_days)`` with
+    ``train_days = 2*252 = 504`` and ``test_days = 1*252 = 252``. A fixture of
+    900 rows (``900 - 504 - 252 = 144 > 0``) therefore produces at least one
+    real window, so the scoring / drawdown / best_config logic is exercised.
+    """
+    n = 900
+    close = 100.0 + np.arange(n) * 1.0
+    return _ohlcv_from_close(close)
+
+
+@pytest.fixture
 def downtrend_df() -> pd.DataFrame:
     """A clear, monotonically falling series (~650 trading days)."""
     n = 650
@@ -238,8 +253,43 @@ def test_regime_filter_true_in_uptrend_false_in_downtrend(uptrend_df, downtrend_
 # ---------------------------------------------------------------------------
 # walk_forward_optimize (pure, offline)
 # ---------------------------------------------------------------------------
+def test_walk_forward_optimize_returns_config_and_curve(long_uptrend_df):
+    """A >=800-row fixture enters the loop and yields a real config + curve.
+
+    This is the critical integration test: the 900-row fixture guarantees at
+    least one train/test window runs, so the windowing, dynamic slippage,
+    regime masking, scoring, drawdown filter and ``best_config`` construction
+    are all genuinely exercised (not short-circuited to the ``None`` branch).
+    """
+    best, equity_curve = walk_forward_optimize(
+        long_uptrend_df,
+        ticker="SYNTH",
+        strategy_names=["Momentum", "Bollinger_Squeeze"],
+        stop_loss_range=[0.05, 0.1],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+    )
+    # The loop MUST have produced a real configuration here.
+    assert isinstance(best, dict), "walk-forward loop did not produce a config"
+    assert set(best.keys()) == EXPECTED_CONFIG_KEYS
+    assert best["ticker"] == "SYNTH"
+    assert best["strategy"] in {"Momentum", "Bollinger_Squeeze"}
+    assert best["stop_loss"] in {0.05, 0.1}
+    # Risk filter: drawdown constraint must hold for any returned config.
+    assert best["max_drawdown"] <= 0.25
+    # Scoring produces finite Sharpe/Sortino numbers.
+    assert np.isfinite(best["sharpe"]) and np.isfinite(best["sortino"])
+    # The winning config carries a non-trivial equity (return) curve for the
+    # dashboard, one value per test-window bar.
+    assert isinstance(equity_curve, list)
+    assert len(equity_curve) >= 2
+    assert all(np.isfinite(v) for v in equity_curve)
+
+
 def test_walk_forward_optimize_offline_uptrend(uptrend_df):
-    best = walk_forward_optimize(
+    best, equity_curve = walk_forward_optimize(
         uptrend_df,
         ticker="SYNTH",
         strategy_names=["Momentum", "Bollinger_Squeeze"],
@@ -251,7 +301,9 @@ def test_walk_forward_optimize_offline_uptrend(uptrend_df):
     )
     # Either a fully-formed config or None (if nothing qualifies).
     assert best is None or isinstance(best, dict)
-    if best is not None:
+    if best is None:
+        assert equity_curve is None
+    else:
         assert set(best.keys()) == EXPECTED_CONFIG_KEYS
         assert best["ticker"] == "SYNTH"
         assert best["strategy"] in {"Momentum", "Bollinger_Squeeze"}
@@ -261,7 +313,7 @@ def test_walk_forward_optimize_offline_uptrend(uptrend_df):
 
 
 def test_walk_forward_optimize_respects_drawdown_limit(mean_reverting_df):
-    best = walk_forward_optimize(
+    best, _ = walk_forward_optimize(
         mean_reverting_df,
         ticker="OSC",
         strategy_names=["Momentum", "Bollinger_Squeeze"],
@@ -272,6 +324,49 @@ def test_walk_forward_optimize_respects_drawdown_limit(mean_reverting_df):
         latency_jitter=0.0,
     )
     assert best is None or (isinstance(best, dict) and best["max_drawdown"] <= 0.25)
+
+
+def test_walk_forward_optimize_stop_loss_affects_pnl():
+    """Different stop-loss levels must produce different realized metrics.
+
+    A volatile series with real adverse moves means clipping per-period losses
+    at ``-sl`` changes the return path, so a tight stop and a loose stop score
+    differently. This guards against the stop-loss sweep being cosmetic.
+    """
+    rng = np.random.default_rng(123)
+    n = 900
+    # Upward drift with meaningful volatility so stops actually bind.
+    steps = rng.normal(0.4, 6.0, n)
+    close = 300.0 + np.cumsum(steps)
+    close = np.maximum(close, 10.0)  # keep prices positive
+    df = _ohlcv_from_close(close)
+
+    tight, _ = walk_forward_optimize(
+        df,
+        ticker="VOL",
+        strategy_names=["Momentum"],
+        stop_loss_range=[0.01],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        max_drawdown_limit=1.0,
+    )
+    loose, _ = walk_forward_optimize(
+        df,
+        ticker="VOL",
+        strategy_names=["Momentum"],
+        stop_loss_range=[0.5],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        max_drawdown_limit=1.0,
+    )
+    assert tight is not None and loose is not None
+    # The stop-loss level is applied to the return path, so a very tight stop
+    # and a very loose stop should not yield identical Sharpe values.
+    assert tight["sharpe"] != loose["sharpe"]
 
 
 # ---------------------------------------------------------------------------

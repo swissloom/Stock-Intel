@@ -84,7 +84,7 @@ def main() -> int:
     latency = settings.get("latency", _DEFAULTS["latency"])
 
     try:
-        best_config = run_walk_forward(
+        best_config, equity_curve = run_walk_forward(
             ticker=settings["ticker"],
             strategy_names=settings["strategies"],
             stop_loss_range=settings["stop_loss_range"],
@@ -98,6 +98,7 @@ def main() -> int:
             ),
             latency_base_delay=latency.get("base_delay", 0.1),
             latency_jitter=latency.get("jitter", 0.05),
+            return_equity_curve=True,
         )
     except DataFetchError as exc:
         # Graceful handling: a transient Yahoo rate-limit / network failure must
@@ -105,8 +106,16 @@ def main() -> int:
         print(f"[x] Market data unavailable: {exc}")
         print("[x] Skipping optimization; no dashboard generated.")
         return 1
+    except Exception as exc:  # noqa: BLE001 - defensive top-level guard
+        # Any non-fetch failure raised from inside the optimization (bad config,
+        # unexpected data shape, etc.) is surfaced cleanly rather than as a raw
+        # traceback, keeping the CLI robust end-to-end.
+        print(f"[x] Optimization failed: {type(exc).__name__}: {exc}")
+        return 1
 
-    dashboard_path = generate_dashboard(best_config)
+    # Pass the winning configuration's cumulative-return (equity) curve so the
+    # self-contained dashboard renders the spec-required return curve.
+    dashboard_path = generate_dashboard(best_config, equity_curve=equity_curve)
     print(f"[+] Dashboard written to: {dashboard_path}")
     return 0
 
