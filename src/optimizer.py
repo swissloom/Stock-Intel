@@ -13,10 +13,13 @@ import pandas as pd
 
 from src.data_fetcher import fetch_market_data
 from src.risk_engine import (
+    cagr_pct,
     calculate_metrics,
+    compute_trade_stats,
     dynamic_slippage,
     regime_filter,
     simulate_latency,
+    total_return_pct,
 )
 from src.strategies import apply_strategy
 
@@ -44,26 +47,69 @@ def walk_forward_optimize(
     max_drawdown_limit: float = DEFAULT_MAX_DRAWDOWN_LIMIT,
     latency_base_delay: float = DEFAULT_LATENCY_BASE_DELAY,
     latency_jitter: float = DEFAULT_LATENCY_JITTER,
+    return_details: bool = False,
 ):
     """Run the walk-forward sweep over a pre-fetched OHLCV ``data`` frame.
 
     This is the pure, network-free core of the optimizer. It computes rolling
     annualized volatility and the market-regime mask, then iterates
     train/test windows sweeping strategies x stop-loss levels, applying dynamic
-    slippage + simulated latency, scoring ``sharpe + sortino`` and disqualifying
-    any configuration whose max drawdown exceeds ``max_drawdown_limit``.
+    slippage + simulated latency, computing institutional performance metrics
+    and disqualifying any configuration whose max drawdown exceeds
+    ``max_drawdown_limit``.
+
+    Selection objective
+    --------------------
+    Among candidates the winner maximizes
+    ``(cagr_pct * profit_factor) / (max_drawdown + 1e-5)``.
+
+    Profitability guardrail
+    -----------------------
+    Any configuration whose **Total Return % <= 0** is flagged ``UNPROFITABLE``
+    and can never become ``best_config`` regardless of its objective score.
+    The existing ``max_drawdown > max_drawdown_limit`` risk filter is also kept.
 
     The swept stop-loss level is applied to the per-period return path: any
     single-period loss worse than ``-sl`` is capped at ``-sl`` (a simple
     per-bar stop), so different stop-loss levels genuinely change the realized
     P&L and the scored metrics rather than merely being recorded.
 
+    Conventions
+    -----------
+    Equity curves (strategy and benchmark) are built additively via
+    ``returns.fillna(0.0).cumsum()``. Total Return % is therefore the additive
+    ``sum(returns) * 100`` (see :func:`src.risk_engine.total_return_pct`) and
+    CAGR annualizes it with ``TRADING_DAYS_PER_YEAR`` = 252.
+
     Returns
     -------
-    tuple(dict | None, list | None)
-        ``(best_config, equity_curve)`` where ``equity_curve`` is the
-        cumulative-return series (as a list of floats) for the winning
-        configuration, or ``(None, None)`` when nothing qualifies.
+    When ``return_details`` is ``False`` (default):
+        ``(best_config, equity_curve)`` where ``best_config`` holds exactly the
+        original 8 keys and ``equity_curve`` is the winning config's additive
+        cumulative-return series (list of floats), or ``(None, None)`` when
+        nothing qualifies.
+
+    When ``return_details`` is ``True``:
+        ``(best_config, equity_curve, details)``. ``details`` is a dict with:
+
+        * ``total_return_pct``, ``cagr_pct``, ``profit_factor``,
+          ``win_rate_pct``, ``total_trades``, ``avg_trade_duration_days`` for
+          the winning config;
+        * ``benchmark_total_return_pct`` and ``benchmark_equity_curve`` (list,
+          length-aligned with ``equity_curve``) for Buy & Hold over the winning
+          test window;
+        * ``latency_ms`` (execution delay in milliseconds) and
+          ``dynamic_slippage_pct`` (estimated slippage as a percentage);
+        * ``period_start`` / ``period_end`` ISO date strings from the winning
+          test-window index;
+        * ``objective`` (the winning objective score);
+        * ``sweep`` - the full list of every tested configuration's result
+          dicts; and ``top10`` - that list ranked by profit factor (desc) then
+          sharpe (desc), truncated to 10.
+
+        When nothing qualifies ``best_config`` and ``equity_curve`` are ``None``
+        but ``details`` is still returned (with ``sweep``/``top10`` populated
+        from all tested configs, including UNPROFITABLE ones).
     """
     volatility = data["Close"].pct_change().rolling(21).std() * np.sqrt(252)
     regime = regime_filter(data)
@@ -74,6 +120,9 @@ def walk_forward_optimize(
     best_overall_score = -np.inf
     best_config = None
     best_equity_curve = None
+    best_details = None
+
+    sweep: list[dict] = []
 
     for start_idx in range(0, len(data) - train_days - test_days, test_days):
         train_end = start_idx + train_days
@@ -103,17 +152,60 @@ def walk_forward_optimize(
                 returns = returns.clip(lower=-sl)
 
                 valid_regime = regime.iloc[train_end:test_end]
-                returns = returns * valid_regime.astype(int)
+                returns = (returns * valid_regime.astype(int)).fillna(0.0)
 
                 sharpe, sortino, mdd = calculate_metrics(returns)
+
+                # Institutional metrics on the realized return path.
+                tr_pct = total_return_pct(returns)
+                n_periods = int(returns.shape[0])
+                c_pct = cagr_pct(tr_pct, n_periods)
+                trade_stats = compute_trade_stats(test_signals["Signal"], returns)
+                profit_factor = trade_stats["profit_factor"]
+                unprofitable = tr_pct <= 0.0
+
+                # Objective: (CAGR% * ProfitFactor) / (MaxDrawdown + 1e-5).
+                objective = (c_pct * profit_factor) / (mdd + 1e-5)
+
+                # Benchmark (Buy & Hold) over the SAME test window, additive.
+                bench_returns = test_data["Close"].pct_change().fillna(0.0)
+                bench_total_return_pct = total_return_pct(bench_returns)
+                bench_equity_curve = (
+                    bench_returns.cumsum().astype(float).tolist()
+                )
+
+                equity_curve = returns.cumsum().astype(float).tolist()
+
+                sweep_entry = {
+                    "ticker": ticker,
+                    "strategy": strategy,
+                    "stop_loss": sl,
+                    "sharpe": round(sharpe, 3),
+                    "sortino": round(sortino, 3),
+                    "max_drawdown": round(mdd, 4),
+                    "total_return_pct": round(tr_pct, 3),
+                    "cagr_pct": round(c_pct, 3),
+                    "profit_factor": round(profit_factor, 3),
+                    "win_rate_pct": round(trade_stats["win_rate_pct"], 2),
+                    "total_trades": trade_stats["total_trades"],
+                    "avg_trade_duration_days": round(
+                        trade_stats["avg_trade_duration_days"], 2
+                    ),
+                    "unprofitable": bool(unprofitable),
+                    "objective": round(objective, 4),
+                }
+                sweep.append(sweep_entry)
 
                 # Risk filter: disqualify configs exceeding the drawdown limit.
                 if mdd > max_drawdown_limit:
                     continue
 
-                score = sharpe + sortino
-                if score > best_overall_score:
-                    best_overall_score = score
+                # Profitability guardrail: never select an unprofitable config.
+                if unprofitable:
+                    continue
+
+                if objective > best_overall_score:
+                    best_overall_score = objective
                     best_config = {
                         "ticker": ticker,
                         "strategy": strategy,
@@ -124,13 +216,59 @@ def walk_forward_optimize(
                         "execution_delay_sec": round(delay, 3),
                         "estimated_slippage": round(slip, 5),
                     }
-                    # Retain the winning config's cumulative-return (equity)
-                    # curve so the dashboard can render the return curve.
-                    best_equity_curve = (
-                        returns.fillna(0.0).cumsum().astype(float).tolist()
-                    )
+                    # Retain the winning config's additive cumulative-return
+                    # (equity) curve so the dashboard can render the return
+                    # curve.
+                    best_equity_curve = equity_curve
 
-    return best_config, best_equity_curve
+                    idx = test_data.index
+                    best_details = {
+                        "total_return_pct": round(tr_pct, 3),
+                        "cagr_pct": round(c_pct, 3),
+                        "profit_factor": round(profit_factor, 3),
+                        "win_rate_pct": round(trade_stats["win_rate_pct"], 2),
+                        "total_trades": trade_stats["total_trades"],
+                        "avg_trade_duration_days": round(
+                            trade_stats["avg_trade_duration_days"], 2
+                        ),
+                        "benchmark_total_return_pct": round(
+                            bench_total_return_pct, 3
+                        ),
+                        "benchmark_equity_curve": bench_equity_curve,
+                        "latency_ms": round(delay * 1000.0, 2),
+                        "dynamic_slippage_pct": round(slip * 100.0, 5),
+                        "period_start": (
+                            str(idx[0].date())
+                            if len(idx) and hasattr(idx[0], "date")
+                            else (str(idx[0]) if len(idx) else None)
+                        ),
+                        "period_end": (
+                            str(idx[-1].date())
+                            if len(idx) and hasattr(idx[-1], "date")
+                            else (str(idx[-1]) if len(idx) else None)
+                        ),
+                        "objective": round(objective, 4),
+                    }
+
+    if not return_details:
+        return best_config, best_equity_curve
+
+    # Rank every tested config by Profit Factor (desc) then Sharpe (desc).
+    ranked = sorted(
+        sweep,
+        key=lambda e: (e["profit_factor"], e["sharpe"]),
+        reverse=True,
+    )
+    top10 = ranked[:10]
+
+    if best_details is None:
+        details = {"sweep": sweep, "top10": top10}
+    else:
+        details = dict(best_details)
+        details["sweep"] = sweep
+        details["top10"] = top10
+
+    return best_config, best_equity_curve, details
 
 
 def run_walk_forward(
@@ -148,6 +286,7 @@ def run_walk_forward(
     latency_jitter: float = DEFAULT_LATENCY_JITTER,
     data: pd.DataFrame | None = None,
     return_equity_curve: bool = False,
+    return_details: bool = False,
 ):
     """Download market data and run the walk-forward optimization pipeline.
 
@@ -159,6 +298,13 @@ def run_walk_forward(
     documented behaviour. When ``return_equity_curve=True`` the function
     instead returns a ``(best_config, equity_curve)`` tuple so callers (such as
     the dashboard renderer) can draw the winning configuration's return curve.
+
+    When ``return_details=True`` is combined with ``return_equity_curve=True``
+    the function returns ``(best_config, equity_curve, details)`` where
+    ``details`` is the opt-in structure documented on
+    :func:`walk_forward_optimize` (metrics, benchmark, latency_ms,
+    dynamic_slippage_pct, period dates, full sweep and top-10 ranking). Default
+    behaviour is unchanged.
     """
     if data is None:
         print(f"[*] Downloading market data for ticker: {ticker}...")
@@ -166,7 +312,7 @@ def run_walk_forward(
 
     print("[*] Initiating Walk-Forward Optimization pipeline...")
 
-    best_config, equity_curve = walk_forward_optimize(
+    opt_result = walk_forward_optimize(
         data,
         ticker=ticker,
         strategy_names=strategy_names,
@@ -177,7 +323,13 @@ def run_walk_forward(
         max_drawdown_limit=max_drawdown_limit,
         latency_base_delay=latency_base_delay,
         latency_jitter=latency_jitter,
+        return_details=return_details,
     )
+    if return_details:
+        best_config, equity_curve, details = opt_result
+    else:
+        best_config, equity_curve = opt_result
+        details = None
 
     print("\n==========================================")
     print(" OPTIMIZATION RESULTS")
@@ -189,6 +341,10 @@ def run_walk_forward(
         print("No strategy configuration satisfied risk constraints.")
     print("==========================================\n")
 
+    if return_equity_curve and return_details:
+        return best_config, equity_curve, details
     if return_equity_curve:
         return best_config, equity_curve
+    if return_details:
+        return best_config, details
     return best_config
