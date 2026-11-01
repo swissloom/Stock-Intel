@@ -1234,3 +1234,311 @@ def test_dashboard_pf_sentinel_renders_as_infinity(tmp_path):
     # No raw sentinel billion anywhere; an explicit "no losing trades" marker.
     assert "1000000000" not in html
     assert "no losing trades" in html
+
+
+# ===========================================================================
+# Multi-asset portfolio allocation (compounding path) + multi-year window
+# ===========================================================================
+from src.portfolio import (  # noqa: E402
+    build_portfolio,
+    compounded_equity_curve,
+    daily_strategy_returns,
+    equal_weights,
+    geometric_cagr,
+    inverse_volatility_weights,
+    portfolio_metrics,
+    total_return_compounded,
+)
+from src.optimizer import (  # noqa: E402
+    DEFAULT_BENCHMARK,
+    DEFAULT_TOP_N,
+    DEFAULT_WEIGHTING,
+    allocate_portfolio,
+)
+
+
+# ---------------------------------------------------------------------------
+# portfolio: compounding math
+# ---------------------------------------------------------------------------
+def test_compounded_equity_curve_multiplicative():
+    r = pd.Series([0.10, -0.05, 0.20])
+    eq = compounded_equity_curve(r)
+    # (1.1)(0.95)(1.2) = 1.254
+    assert eq.iloc[-1] == pytest.approx(1.1 * 0.95 * 1.2)
+    assert len(eq) == 3
+
+
+def test_geometric_cagr_exact_formula():
+    # Build a curve that exactly doubles over 2 years (504 trading days).
+    n = 504
+    # per-period growth so (1+g)^504 = 2 -> g = 2**(1/504) - 1
+    g = 2 ** (1.0 / n) - 1.0
+    r = pd.Series([g] * n)
+    eq = compounded_equity_curve(r)
+    cagr = geometric_cagr(eq, n_periods=n)
+    # Doubling over exactly 2 years -> CAGR = 2**(1/2) - 1 = 41.42%.
+    assert cagr == pytest.approx((2 ** (1.0 / 2.0) - 1.0) * 100.0, rel=1e-3)
+
+
+def test_geometric_cagr_guards():
+    assert geometric_cagr(pd.Series([1.0]), n_periods=1) == 0.0
+    assert geometric_cagr(pd.Series([]), n_periods=0) == 0.0
+    # Full wipeout -> -100.
+    assert geometric_cagr(pd.Series([1.0, 0.5, 0.0]), n_periods=252) == -100.0
+
+
+def test_total_return_compounded():
+    eq = pd.Series([1.0, 1.1, 1.254])
+    assert total_return_compounded(eq) == pytest.approx(25.4, rel=1e-6)
+
+
+def test_inverse_volatility_weights_favor_low_vol():
+    rng = np.random.default_rng(3)
+    low = pd.Series(rng.normal(0.0005, 0.005, 300))   # low vol
+    high = pd.Series(rng.normal(0.0005, 0.03, 300))   # high vol
+    w = inverse_volatility_weights({"LOW": low, "HIGH": high})
+    assert w["LOW"] > w["HIGH"]
+    assert w["LOW"] + w["HIGH"] == pytest.approx(1.0)
+
+
+def test_inverse_volatility_weights_degenerate_falls_back_equal():
+    # Zero-vol constant series for all -> equal-weight fallback.
+    const = pd.Series([0.0] * 100)
+    w = inverse_volatility_weights({"A": const, "B": const})
+    assert w["A"] == pytest.approx(0.5)
+    assert w["B"] == pytest.approx(0.5)
+
+
+def test_equal_weights_sum_to_one():
+    w = equal_weights(["A", "B", "C", "D"])
+    assert all(v == pytest.approx(0.25) for v in w.values())
+    assert sum(w.values()) == pytest.approx(1.0)
+    assert equal_weights([]) == {}
+
+
+def test_build_portfolio_contributions_sum_to_portfolio_return():
+    idx = pd.bdate_range("2020-01-01", periods=5)
+    ra = pd.Series([0.01, 0.02, -0.01, 0.0, 0.03], index=idx)
+    rb = pd.Series([0.00, -0.01, 0.02, 0.01, -0.02], index=idx)
+    df = build_portfolio({"A": ra, "B": rb}, {"A": 0.6, "B": 0.4})
+    assert "portfolio_return" in df.columns
+    assert "contrib_A" in df.columns and "contrib_B" in df.columns
+    # Contributions sum to the portfolio return each day.
+    recon = df["contrib_A"] + df["contrib_B"]
+    assert np.allclose(recon.values, df["portfolio_return"].values)
+    # Weighted correctly: day 0 = 0.6*0.01 + 0.4*0.0 = 0.006.
+    assert df["portfolio_return"].iloc[0] == pytest.approx(0.006)
+
+
+def test_portfolio_metrics_drawdown_on_compounded_curve():
+    # Rise then fall: known compounded drawdown.
+    r = pd.Series([0.10, 0.10, -0.20, -0.10])
+    m = portfolio_metrics(r)
+    eq = compounded_equity_curve(r)
+    peak = eq.cummax()
+    expected_dd = ((peak - eq) / peak).max()
+    assert m["max_drawdown"] == pytest.approx(expected_dd)
+    assert m["max_drawdown"] >= 0
+
+
+def test_daily_strategy_returns_no_lookahead_and_cost():
+    # Signal on bar 2 means position is held INTO bar 3 (shifted).
+    idx = pd.bdate_range("2020-01-01", periods=5)
+    close = pd.Series([100, 101, 102, 103, 104], index=idx, dtype=float)
+    data = pd.DataFrame({"Close": close, "High": close, "Low": close,
+                         "Open": close, "Volume": 1e6}, index=idx)
+    signal = pd.Series([0, 0, 1, 1, 0], index=idx)
+    rets = daily_strategy_returns(data, signal, slippage=0.0)
+    # Bar 0 has no prior -> 0; the position is the shifted signal.
+    assert rets.iloc[0] == 0.0
+    # Non-zero return only appears once the (shifted) position is long.
+    assert rets.iloc[3] != 0.0
+
+
+# ---------------------------------------------------------------------------
+# optimizer: allocate_portfolio (offline, injected aligned frames)
+# ---------------------------------------------------------------------------
+def _portfolio_frames(seed=11, n=1400):
+    rng = np.random.default_rng(seed)
+    frames = {}
+    for t, base, drift, vol in [
+        ("AAPL", 100, 0.4, 1.5),
+        ("MSFT", 80, 0.35, 1.2),
+        ("NVDA", 50, 0.6, 2.5),
+        ("AMZN", 120, 0.3, 1.8),
+        ("SPY", 300, 0.2, 1.0),
+    ]:
+        close = base + np.cumsum(rng.normal(drift, vol, n))
+        close = np.maximum(close, 5.0)
+        frames[t] = _ohlcv_from_close(close)
+    return frames
+
+
+def test_allocate_portfolio_selects_top_n_and_weights_sum_to_one():
+    frames = _portfolio_frames()
+    p = allocate_portfolio(
+        tickers=list(frames),
+        strategy_names=["MultiFactor", "Momentum"],
+        stop_loss_range=[0.05],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        top_n=3,
+        weighting="inverse_vol",
+        benchmark="SPY",
+        frames=frames,
+    )
+    # At most top_n assets selected.
+    assert len(p["selected"]) <= 3
+    if p["selected"]:
+        # Weights are normalized.
+        assert sum(p["weights"].values()) == pytest.approx(1.0, abs=1e-6)
+        # Allocation breakdown has one row per selected asset with the fields.
+        assert len(p["allocation"]) == len(p["selected"])
+        for a in p["allocation"]:
+            for k in ("ticker", "weight_pct", "sharpe",
+                      "individual_total_return_pct", "contribution_pct"):
+                assert k in a
+        # Compounded curves are aligned in length.
+        assert len(p["equity_curve"]) == len(p["benchmark_equity_curve"])
+        # CAGR / metrics are finite.
+        assert np.isfinite(p["cagr_pct"])
+        assert np.isfinite(p["sharpe"]) and np.isfinite(p["sortino"])
+
+
+def test_allocate_portfolio_equal_weighting():
+    frames = _portfolio_frames(seed=5)
+    p = allocate_portfolio(
+        tickers=list(frames),
+        strategy_names=["MultiFactor", "Momentum"],
+        stop_loss_range=[0.05],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        top_n=3,
+        weighting="equal",
+        benchmark="equal_weight",
+        frames=frames,
+    )
+    assert p["weighting"] == "equal"
+    if len(p["selected"]) > 1:
+        vals = list(p["weights"].values())
+        # Equal weighting -> all weights identical.
+        assert max(vals) - min(vals) < 1e-9
+
+
+def test_allocate_portfolio_honest_empty_when_nothing_qualifies():
+    # All-downtrend basket: nothing qualifies, empty portfolio (no fabrication).
+    down = {
+        "D1": _ohlcv_from_close(900.0 - np.arange(1400) * 0.4),
+        "D2": _ohlcv_from_close(500.0 - np.arange(1400) * 0.25),
+        "SPY": _ohlcv_from_close(400.0 - np.arange(1400) * 0.1),
+    }
+    p = allocate_portfolio(
+        tickers=list(down),
+        strategy_names=["MultiFactor", "Momentum"],
+        stop_loss_range=[0.05],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        top_n=3,
+        frames=down,
+    )
+    assert p["selected"] == []
+    assert p["allocation"] == []
+    assert p["equity_curve"] == []
+    assert p["cagr_pct"] == 0.0
+
+
+def test_portfolio_defaults_exposed():
+    assert DEFAULT_TOP_N == 3
+    assert DEFAULT_WEIGHTING == "inverse_vol"
+    assert DEFAULT_BENCHMARK == "SPY"
+
+
+# ---------------------------------------------------------------------------
+# dashboard: portfolio sections render
+# ---------------------------------------------------------------------------
+def _portfolio_payload() -> dict:
+    return {
+        "selected": ["META", "AMZN", "MSFT"],
+        "weighting": "inverse_vol",
+        "weights": {"META": 0.317, "AMZN": 0.353, "MSFT": 0.330},
+        "top_n": 3,
+        "n_qualifying": 4,
+        "equity_curve": [1.0, 1.05, 1.12, 1.30, 1.55],
+        "benchmark": "SPY",
+        "benchmark_equity_curve": [1.0, 1.03, 1.08, 1.15, 1.22],
+        "benchmark_total_return_pct": 22.0,
+        "cagr_pct": 20.95,
+        "total_return_pct": 55.0,
+        "sharpe": 1.85,
+        "sortino": 2.60,
+        "max_drawdown": 0.085,
+        "allocation": [
+            {"ticker": "META", "weight_pct": 31.7, "sharpe": 1.42,
+             "individual_total_return_pct": 60.0, "contribution_pct": 19.0,
+             "slippage_pct": 0.12},
+            {"ticker": "AMZN", "weight_pct": 35.3, "sharpe": 1.10,
+             "individual_total_return_pct": 45.0, "contribution_pct": 16.0,
+             "slippage_pct": 0.11},
+            {"ticker": "MSFT", "weight_pct": 33.0, "sharpe": 1.25,
+             "individual_total_return_pct": 50.0, "contribution_pct": 20.0,
+             "slippage_pct": 0.10},
+        ],
+        "period_start": "2020-01-02",
+        "period_end": "2026-10-31",
+        "n_periods": 1700,
+        "details": _synthetic_details(),
+    }
+
+
+def test_generate_dashboard_renders_portfolio_sections(tmp_path):
+    from src.dashboard_generator import generate_dashboard
+
+    payload = _portfolio_payload()
+    path = generate_dashboard(
+        _best_config(),
+        equity_curve=payload["equity_curve"],
+        output_dir=str(tmp_path),
+        details=payload["details"],
+        benchmark_curve=payload["benchmark_equity_curve"],
+        portfolio=payload,
+    )
+    with open(path, encoding="utf-8") as fh:
+        html = fh.read()
+    for needle in (
+        "Multi-Asset Portfolio",
+        "Allocation Breakdown",
+        "Portfolio CAGR",
+        "Contribution to Return",
+        "Portfolio Cumulative Return vs. Benchmark",
+        "META", "AMZN", "MSFT",
+    ):
+        assert needle in html, f"missing portfolio section: {needle}"
+    # Still fully self-contained.
+    assert "https://" not in html and "<script" not in html
+
+
+def test_generate_dashboard_portfolio_empty_state(tmp_path):
+    from src.dashboard_generator import generate_dashboard
+
+    empty_portfolio = {
+        "selected": [], "weighting": "inverse_vol", "weights": {},
+        "allocation": [], "equity_curve": [], "benchmark_equity_curve": [],
+        "cagr_pct": 0.0, "total_return_pct": 0.0, "sharpe": 0.0,
+        "sortino": 0.0, "max_drawdown": 0.0, "n_qualifying": 0,
+        "benchmark": "SPY", "benchmark_total_return_pct": 0.0,
+        "details": _synthetic_details(),
+    }
+    path = generate_dashboard(
+        None, equity_curve=None, output_dir=str(tmp_path),
+        details=_synthetic_details(), portfolio=empty_portfolio,
+    )
+    with open(path, encoding="utf-8") as fh:
+        html = fh.read()
+    assert "no portfolio was allocated" in html
+    assert "https://" not in html

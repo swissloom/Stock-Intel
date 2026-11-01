@@ -26,6 +26,7 @@ from src.data_fetcher import DataFetchError
 from src.optimizer import (
     DEFAULT_BASE_SLIPPAGE,
     DEFAULT_MAX_DRAWDOWN_LIMIT,
+    allocate_portfolio,
     optimize_universe,
     run_walk_forward,
     walk_forward_optimize,  # noqa: F401 - exposed for testing/import parity
@@ -46,6 +47,7 @@ __all__ = [
     "regime_filter",
     "run_walk_forward",
     "optimize_universe",
+    "allocate_portfolio",
     "load_settings",
     "main",
 ]
@@ -60,10 +62,11 @@ _DEFAULTS = {
     "stop_loss_range": [0.02, 0.05, 0.08],
     "train_window_years": 2,
     "test_window_years": 1,
-    "date_range": {"start": "2020-01-01", "end": "2026-01-01"},
+    "date_range": {"start": "2020-01-01", "end": "2026-11-01"},
     "risk": {"max_drawdown_limit": DEFAULT_MAX_DRAWDOWN_LIMIT, "risk_free_rate": 0.0},
     "base_slippage": DEFAULT_BASE_SLIPPAGE,
     "latency": {"base_delay": 0.1, "jitter": 0.05},
+    "portfolio": {"top_n": 3, "weighting": "inverse_vol", "benchmark": "SPY"},
 }
 
 
@@ -89,23 +92,32 @@ def main() -> int:
     # The multi-ticker universe is driven by `assets` (falling back to the
     # single `ticker` for backward compatibility).
     universe = settings.get("assets") or [settings.get("ticker", "AAPL")]
+    portfolio_cfg = settings.get("portfolio", _DEFAULTS["portfolio"])
 
     try:
-        best_config, equity_curve, details = optimize_universe(
+        portfolio = allocate_portfolio(
             tickers=universe,
             strategy_names=settings["strategies"],
             stop_loss_range=settings["stop_loss_range"],
             train_window_years=settings["train_window_years"],
             test_window_years=settings["test_window_years"],
             start=date_range.get("start", "2020-01-01"),
-            end=date_range.get("end", "2026-01-01"),
+            end=date_range.get("end", "2026-11-01"),
             base_slippage=settings.get("base_slippage", DEFAULT_BASE_SLIPPAGE),
             max_drawdown_limit=risk.get(
                 "max_drawdown_limit", DEFAULT_MAX_DRAWDOWN_LIMIT
             ),
             latency_base_delay=latency.get("base_delay", 0.1),
             latency_jitter=latency.get("jitter", 0.05),
+            top_n=portfolio_cfg.get("top_n", 3),
+            weighting=portfolio_cfg.get("weighting", "inverse_vol"),
+            benchmark=portfolio_cfg.get("benchmark", "SPY"),
         )
+        # The universe leaderboard / best-config details ride along inside the
+        # portfolio payload so the dashboard keeps rendering the sweep table.
+        details = portfolio.get("details")
+        best_config = _portfolio_best_config(portfolio, details)
+        equity_curve = portfolio.get("equity_curve")
     except DataFetchError as exc:
         # Graceful handling: a transient Yahoo rate-limit / network failure must
         # not crash with an unhandled stack trace from a None DataFrame.
@@ -128,18 +140,50 @@ def main() -> int:
     # (latency_ms = execution_delay_sec * 1000, dynamic_slippage_pct =
     # estimated_slippage * 100). The benchmark equity curve is sourced from
     # details['benchmark_equity_curve'] by generate_dashboard.
-    benchmark_curve = details.get("benchmark_equity_curve") if details else None
+    # The portfolio supplies its own compounded benchmark curve; the dashboard
+    # renders the multi-asset portfolio grid, allocation table and the
+    # portfolio-vs-benchmark equity chart from the `portfolio` payload.
+    benchmark_curve = portfolio.get("benchmark_equity_curve")
     dashboard_path = generate_dashboard(
         best_config,
         equity_curve=equity_curve,
         details=details,
         benchmark_curve=benchmark_curve,
+        portfolio=portfolio,
     )
     print(f"[+] Dashboard written to: {dashboard_path}")
     return 0
 
 
+def _portfolio_best_config(portfolio: dict, details: dict | None) -> dict | None:
+    """Synthesize a best-config-shaped dict for the dashboard header.
+
+    The portfolio is multi-asset, so there is no single "best config". When the
+    universe optimizer still identified a per-ticker champion we reuse it;
+    otherwise we synthesize a minimal portfolio-level config so the dashboard's
+    existing config-driven sections (Sharpe/Sortino/drawdown cards, cost model)
+    render for the portfolio as a whole.
+    """
+    if not portfolio or not portfolio.get("selected"):
+        return None
+    selected = portfolio["selected"]
+    return {
+        "ticker": " + ".join(selected),
+        "strategy": "MultiFactor Portfolio ({})".format(portfolio.get("weighting")),
+        "stop_loss": 0.0,
+        "sharpe": portfolio.get("sharpe", 0.0),
+        "sortino": portfolio.get("sortino", 0.0),
+        "max_drawdown": portfolio.get("max_drawdown", 0.0),
+        "execution_delay_sec": 0.0,
+        "estimated_slippage": (
+            portfolio["allocation"][0]["slippage_pct"] / 100.0
+            if portfolio.get("allocation")
+            else 0.0
+        ),
+    }
+
+
 if __name__ == "__main__":
-    # Mirror the spec reference entrypoint: optimize AAPL across the two
-    # strategies and the stop-loss sweep, then render the dashboard.
+    # Scan the universe over the multi-year regime window, allocate a top-N
+    # multi-asset portfolio, and render the institutional dashboard.
     raise SystemExit(main())
