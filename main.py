@@ -26,6 +26,7 @@ from src.data_fetcher import DataFetchError
 from src.optimizer import (
     DEFAULT_BASE_SLIPPAGE,
     DEFAULT_MAX_DRAWDOWN_LIMIT,
+    optimize_universe,
     run_walk_forward,
     walk_forward_optimize,  # noqa: F401 - exposed for testing/import parity
 )
@@ -44,6 +45,7 @@ __all__ = [
     "simulate_latency",
     "regime_filter",
     "run_walk_forward",
+    "optimize_universe",
     "load_settings",
     "main",
 ]
@@ -53,7 +55,8 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "settings.yaml")
 # Spec defaults used when config/settings.yaml is missing or incomplete.
 _DEFAULTS = {
     "ticker": "AAPL",
-    "strategies": ["Momentum", "Bollinger_Squeeze"],
+    "assets": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY"],
+    "strategies": ["MultiFactor", "Momentum", "Bollinger_Squeeze"],
     "stop_loss_range": [0.02, 0.05, 0.08],
     "train_window_years": 2,
     "test_window_years": 1,
@@ -83,9 +86,13 @@ def main() -> int:
     risk = settings.get("risk", _DEFAULTS["risk"])
     latency = settings.get("latency", _DEFAULTS["latency"])
 
+    # The multi-ticker universe is driven by `assets` (falling back to the
+    # single `ticker` for backward compatibility).
+    universe = settings.get("assets") or [settings.get("ticker", "AAPL")]
+
     try:
-        best_config, equity_curve, details = run_walk_forward(
-            ticker=settings["ticker"],
+        best_config, equity_curve, details = optimize_universe(
+            tickers=universe,
             strategy_names=settings["strategies"],
             stop_loss_range=settings["stop_loss_range"],
             train_window_years=settings["train_window_years"],
@@ -98,8 +105,6 @@ def main() -> int:
             ),
             latency_base_delay=latency.get("base_delay", 0.1),
             latency_jitter=latency.get("jitter", 0.05),
-            return_equity_curve=True,
-            return_details=True,
         )
     except DataFetchError as exc:
         # Graceful handling: a transient Yahoo rate-limit / network failure must

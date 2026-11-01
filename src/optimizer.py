@@ -11,12 +11,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.data_fetcher import fetch_market_data
+from src.data_fetcher import DEFAULT_UNIVERSE, fetch_market_data, fetch_universe
 from src.risk_engine import (
+    MIN_PROFIT_FACTOR,
+    apply_trailing_stop,
     cagr_pct,
     calculate_metrics,
+    compute_atr,
     compute_trade_stats,
     dynamic_slippage,
+    dynamic_slippage_atr,
     regime_filter,
     simulate_latency,
     total_return_pct,
@@ -114,6 +118,16 @@ def walk_forward_optimize(
     volatility = data["Close"].pct_change().rolling(21).std() * np.sqrt(252)
     regime = regime_filter(data)
 
+    # ATR (14) and a 21-day average volume power the ATR/volume-scaled cost
+    # model and the 3x-ATR trailing stop. Computed once over the full frame so
+    # each window can slice its aligned segment cheaply.
+    atr_series = compute_atr(data, period=14)
+    avg_volume_series = (
+        data["Volume"].rolling(21).mean()
+        if "Volume" in data.columns
+        else pd.Series(np.nan, index=data.index)
+    )
+
     train_days = train_window_years * TRADING_DAYS_PER_YEAR
     test_days = test_window_years * TRADING_DAYS_PER_YEAR
 
@@ -140,15 +154,51 @@ def walk_forward_optimize(
                     if not np.isnan(volatility.iloc[train_end])
                     else 0.15
                 )
-                slip = dynamic_slippage(current_vol, base_slippage=base_slippage)
 
-                test_signals = apply_strategy(test_data, strategy)
+                # ATR- and volume-scaled dynamic slippage at the window open.
+                atr_at = atr_series.iloc[train_end]
+                price_at = data["Close"].iloc[train_end]
+                vol_at = avg_volume_series.iloc[train_end]
+                cur_volume = (
+                    data["Volume"].iloc[train_end]
+                    if "Volume" in data.columns
+                    else np.nan
+                )
+                if np.isfinite(atr_at) and np.isfinite(price_at):
+                    slip = dynamic_slippage_atr(
+                        atr=float(atr_at),
+                        price=float(price_at),
+                        volume=float(cur_volume) if np.isfinite(cur_volume) else 0.0,
+                        avg_volume=float(vol_at) if np.isfinite(vol_at) else 0.0,
+                        base_slippage=base_slippage,
+                    )
+                else:
+                    # Warmup fallback: volatility-scaled cost (legacy model).
+                    slip = dynamic_slippage(current_vol, base_slippage=base_slippage)
+
+                raw_signals = apply_strategy(test_data, strategy)
+
+                # 3x-ATR trailing stop applied to the signal to produce the
+                # actually-held position path (close-to-close trailing exit).
+                test_atr = atr_series.iloc[train_end:test_end]
+                test_atr.index = test_data.index
+                held_position = apply_trailing_stop(
+                    raw_signals["Signal"],
+                    test_data["Close"],
+                    test_atr,
+                    atr_multiple=3.0,
+                )
+                # Persist the stop-adjusted position for downstream trade stats.
+                test_signals = raw_signals.copy()
+                test_signals["Signal"] = held_position.astype(int).values
+
                 returns = test_signals["Signal"] * test_data["Close"].pct_change()
                 returns = returns - slip
 
                 # Apply the swept stop-loss to the realized return path: cap any
                 # single-period adverse move at ``-sl`` so the stop-loss level
-                # actually affects P&L (and therefore the scored metrics).
+                # actually affects P&L (and therefore the scored metrics). This
+                # per-bar floor complements the trailing stop above.
                 returns = returns.clip(lower=-sl)
 
                 valid_regime = regime.iloc[train_end:test_end]
@@ -200,8 +250,14 @@ def walk_forward_optimize(
                 if mdd > max_drawdown_limit:
                     continue
 
-                # Profitability guardrail: never select an unprofitable config.
+                # Profitability guardrail: never select an unprofitable config
+                # (Total Return % <= 0).
                 if unprofitable:
+                    continue
+
+                # Profit-factor guardrail: disqualify any config whose profit
+                # factor is below the institutional minimum (PF < 1.3).
+                if profit_factor < MIN_PROFIT_FACTOR:
                     continue
 
                 if objective > best_overall_score:
@@ -348,3 +404,140 @@ def run_walk_forward(
     if return_details:
         return best_config, details
     return best_config
+
+
+def optimize_universe(
+    tickers=DEFAULT_UNIVERSE,
+    strategy_names=None,
+    stop_loss_range=None,
+    train_window_years: int = 2,
+    test_window_years: int = 1,
+    *,
+    start: str = DEFAULT_START,
+    end: str = DEFAULT_END,
+    base_slippage: float = DEFAULT_BASE_SLIPPAGE,
+    max_drawdown_limit: float = DEFAULT_MAX_DRAWDOWN_LIMIT,
+    latency_base_delay: float = DEFAULT_LATENCY_BASE_DELAY,
+    latency_jitter: float = DEFAULT_LATENCY_JITTER,
+    frames: dict | None = None,
+):
+    """Scan a basket of tickers and select the single best configuration.
+
+    Runs :func:`walk_forward_optimize` independently for every ticker in
+    ``tickers`` (each with its own aligned OHLCV frame) and then selects the
+    globally best ``(ticker, strategy, stop_loss)`` configuration by the same
+    objective used per-window: ``(CAGR% * ProfitFactor) / (MaxDrawdown + 1e-5)``.
+    The institutional guardrails (max-drawdown limit, Total Return > 0, and
+    Profit Factor >= :data:`~src.risk_engine.MIN_PROFIT_FACTOR`) are enforced
+    inside :func:`walk_forward_optimize`, so a ticker that qualifies nowhere
+    simply contributes nothing to the winner (but still appears in the
+    leaderboard with its best sweep rows).
+
+    Parameters
+    ----------
+    frames:
+        Optional pre-fetched ``{ticker: OHLCV DataFrame}`` mapping. When
+        provided no network access occurs (used for offline tests). Otherwise
+        the universe is downloaded via :func:`fetch_universe` (reusing the 429
+        backoff + alignment logic).
+
+    Returns
+    -------
+    tuple(best_config, equity_curve, details)
+        ``best_config`` is the winning 8-key config dict augmented with the
+        winning ``ticker`` (already a key), or ``None`` when nothing qualifies
+        across the whole basket. ``equity_curve`` is the winning config's
+        additive cumulative-return series (or ``None``). ``details`` is the
+        winning ticker's details payload, additionally carrying:
+
+        * ``universe`` - list of tickers actually evaluated;
+        * ``universe_sweep`` - every tested config across all tickers (each row
+          carries its ``ticker``); and
+        * ``top10`` - that combined sweep ranked by Profit Factor (desc) then
+          Sharpe (desc), truncated to 10 (a genuine cross-ticker leaderboard).
+
+        When nothing qualifies, ``details`` is still returned with the combined
+        ``universe_sweep`` / ``top10`` so the dashboard can render the honest
+        empty state alongside the full leaderboard.
+    """
+    if strategy_names is None:
+        strategy_names = ["MultiFactor", "Momentum", "Bollinger_Squeeze"]
+    if stop_loss_range is None:
+        stop_loss_range = [0.02, 0.05, 0.08]
+
+    if frames is None:
+        print(f"[*] Downloading universe: {list(tickers)}...")
+        frames = fetch_universe(tickers, start=start, end=end)
+
+    print("[*] Initiating multi-ticker Walk-Forward Optimization...")
+
+    combined_sweep: list[dict] = []
+    best_objective = -np.inf
+    best_config = None
+    best_equity_curve = None
+    best_details = None
+    evaluated: list[str] = []
+
+    for ticker, data in frames.items():
+        if data is None or len(data) == 0:
+            continue
+        evaluated.append(ticker)
+        cfg, equity_curve, details = walk_forward_optimize(
+            data,
+            ticker=ticker,
+            strategy_names=strategy_names,
+            stop_loss_range=stop_loss_range,
+            train_window_years=train_window_years,
+            test_window_years=test_window_years,
+            base_slippage=base_slippage,
+            max_drawdown_limit=max_drawdown_limit,
+            latency_base_delay=latency_base_delay,
+            latency_jitter=latency_jitter,
+            return_details=True,
+        )
+        # Collect this ticker's sweep rows (each already carries 'ticker').
+        combined_sweep.extend(details.get("sweep", []))
+
+        # A qualifying winner for this ticker competes for the global title.
+        if cfg is not None and details is not None:
+            obj = details.get("objective", -np.inf)
+            if obj > best_objective:
+                best_objective = obj
+                best_config = cfg
+                best_equity_curve = equity_curve
+                best_details = details
+
+    # Build the genuine cross-ticker leaderboard.
+    ranked = sorted(
+        combined_sweep,
+        key=lambda e: (e["profit_factor"], e["sharpe"]),
+        reverse=True,
+    )
+    top10 = ranked[:10]
+
+    if best_details is None:
+        details = {
+            "universe": evaluated,
+            "universe_sweep": combined_sweep,
+            "sweep": combined_sweep,
+            "top10": top10,
+        }
+    else:
+        details = dict(best_details)
+        details["universe"] = evaluated
+        details["universe_sweep"] = combined_sweep
+        details["top10"] = top10  # cross-ticker leaderboard overrides per-ticker
+
+    print("\n==========================================")
+    print(" UNIVERSE OPTIMIZATION RESULTS")
+    print("==========================================")
+    print(f" - Tickers evaluated: {evaluated}")
+    if best_config:
+        for k, v in best_config.items():
+            print(f" - {k.replace('_', ' ').title()}: {v}")
+    else:
+        print(" No configuration satisfied the profitability / risk guardrails")
+        print(" across the entire universe. Reporting the honest empty state.")
+    print("==========================================\n")
+
+    return best_config, best_equity_curve, details

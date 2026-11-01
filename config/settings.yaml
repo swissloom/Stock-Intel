@@ -6,17 +6,21 @@
 # Primary ticker used by the default pipeline run.
 ticker: AAPL
 
-# Asset universe (the pipeline optimizes `ticker`; the list documents the
-# broader universe this workstation is intended to cover).
+# Asset universe scanned by the multi-ticker pipeline. Every ticker here is
+# fetched, aligned onto a shared trading calendar, and walk-forward optimized;
+# the globally best (ticker, strategy, stop_loss) configuration wins.
 assets:
   - AAPL
   - MSFT
-  - GOOGL
-  - AMZN
   - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - SPY
 
 # Strategies to sweep during optimization.
 strategies:
+  - MultiFactor
   - Momentum
   - Bollinger_Squeeze
 
