@@ -8,11 +8,44 @@ report.
 
 ## Overview
 
-The pipeline downloads historical OHLCV data, sweeps a set of strategies and
-stop-loss levels across rolling train/test windows (walk-forward), scores each
-configuration by `Sharpe + Sortino`, disqualifies any configuration that breaks
-the max-drawdown limit, and writes the winning configuration (together with its
-cumulative-return / equity curve) to a self-contained HTML dashboard.
+The pipeline downloads historical OHLCV data for a **basket of liquid benchmark
+tickers** (`AAPL, MSFT, NVDA, AMZN, GOOGL, META, SPY`), aligns them onto a
+shared trading calendar, and sweeps a set of strategies and stop-loss levels
+across rolling train/test windows (walk-forward) **for every ticker**. It
+scores each configuration by `(CAGR% x ProfitFactor) / (MaxDrawdown + 1e-5)`,
+disqualifies any configuration that breaks the max-drawdown limit, is
+unprofitable (Total Return <= 0), or has a Profit Factor below **1.3**, and
+writes the globally winning `(ticker, strategy, stop_loss)` configuration
+(together with its cumulative-return / equity curve and a cross-ticker
+leaderboard) to a self-contained HTML dashboard.
+
+### Multi-factor alpha model (`MultiFactor`)
+
+The flagship strategy combines three factors into a binary long/flat signal
+(long only when **all** hold):
+
+* **Momentum:** 126-day (6-month) rate-of-change minus the most recent 21-day
+  rate-of-change (momentum net of the latest pullback) must be positive.
+* **Trend filter:** price strictly above its 200-day SMA.
+* **Volatility filter:** 21-day annualized volatility at or below 50% (extreme
+  tail-risk regimes are excluded).
+
+### Institutional risk engine
+
+* **ATR/volume-scaled slippage:** transaction costs widen with relative ATR and
+  with thin liquidity (volume below its 21-day average).
+* **ATR position sizing & 3x-ATR trailing stop:** volatility-based sizing and a
+  close-to-close trailing stop that forces flat on a 3x-ATR adverse excursion.
+* **Performance guardrails:** any permutation with a negative Total Return or a
+  Profit Factor below 1.3 is disqualified from selection.
+
+### Honesty note
+
+The engine is **not** tuned to produce green reports. Guardrails only ever
+*reject* configurations; they never fabricate a winner. If no configuration in
+the entire universe clears the profitability / risk bar, the dashboard renders
+an honest empty state alongside the full leaderboard. The numbers shown reflect
+the exact mathematical reality of the downloaded data.
 
 ### Stop-loss handling
 
@@ -72,8 +105,10 @@ python main.py
 ```
 
 This reads `config/settings.yaml`, downloads live market data for the configured
-ticker (default **AAPL**), runs the walk-forward optimization, prints the
-`OPTIMIZATION RESULTS` block, and writes `output/index.html`.
+`assets` universe, runs the multi-ticker walk-forward optimization, prints the
+`UNIVERSE OPTIMIZATION RESULTS` block, and writes both `output/dashboard.html`
+(the institutional report artifact) and `output/index.html` (kept identical; the
+CI artifact-verify guard and Cloudflare Pages deploy depend on it).
 
 > **Live data vs. offline tests.** `python main.py` fetches live data from
 > Yahoo Finance and therefore requires internet access. Yahoo intermittently

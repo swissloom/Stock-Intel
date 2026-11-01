@@ -19,8 +19,31 @@ from datetime import datetime, timezone
 
 from jinja2 import Environment
 
+from src.risk_engine import PROFIT_FACTOR_NO_LOSS
+
+
+def _pf_display(value) -> str:
+    """Render a profit factor for display.
+
+    The optimizer uses :data:`~src.risk_engine.PROFIT_FACTOR_NO_LOSS` (1e9) as a
+    sentinel for "winning trades but zero losing trades". Showing the raw
+    billion in an institutional report is misleading, so render it as an honest
+    "no losing trades" marker instead. Ordinary values are shown to 2 dp.
+    """
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if fv >= PROFIT_FACTOR_NO_LOSS:
+        return "\u221e (no losing trades)"  # ∞
+    return f"{fv:.2f}"
+
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_OUTPUT_FILE = "index.html"
+# Task-named institutional artifact. The generator writes BOTH this and
+# ``index.html`` (CI, the artifact-verify guard and the Cloudflare Pages deploy
+# all depend on ``output/index.html``, so it must keep existing).
+DASHBOARD_OUTPUT_FILE = "dashboard.html"
 
 # Strategy / benchmark stroke colours reused by the SVG and the HTML legend.
 _STRATEGY_COLOUR = "#4ade80"
@@ -75,9 +98,9 @@ _TEMPLATE = """<!DOCTYPE html>
 
   {% if config %}
   <div class="grid">
-    <div class="card"><div class="label">Ticker</div>
+    <div class="card"><div class="label">Optimal Ticker</div>
       <div class="value">{{ config.ticker }}</div></div>
-    <div class="card"><div class="label">Optimal Strategy</div>
+    <div class="card"><div class="label">Strategy Name</div>
       <div class="value">{{ config.strategy }}</div></div>
     {% if details %}
     <div class="card"><div class="label">Period</div>
@@ -91,7 +114,7 @@ _TEMPLATE = """<!DOCTYPE html>
     <div class="card"><div class="label">Win Rate</div>
       <div class="value">{{ details.win_rate_pct | round(1) }}%</div></div>
     <div class="card"><div class="label">Profit Factor</div>
-      <div class="value">{{ details.profit_factor | round(2) }}</div></div>
+      <div class="value">{{ details.profit_factor | pf_display }}</div></div>
     <div class="card"><div class="label">Total Trades</div>
       <div class="value">{{ details.total_trades }}</div></div>
     <div class="card"><div class="label">Avg Trade Duration</div>
@@ -112,13 +135,18 @@ _TEMPLATE = """<!DOCTYPE html>
     <table>
       <tr><th>Metric</th><th>Value</th></tr>
       {% if details %}
-      <tr><td>Dynamic slippage</td><td>{{ details.dynamic_slippage_pct | round(4) }}%</td></tr>
-      <tr><td>Latency</td><td>{{ details.latency_ms | round(1) }} ms</td></tr>
+      <tr><td>Date range tested</td><td>{{ details.period_start }} &rarr; {{ details.period_end }}</td></tr>
+      {% if details.universe %}
+      <tr><td>Universe scanned</td><td>{{ details.universe | join(", ") }}</td></tr>
+      {% endif %}
+      <tr><td>Dynamic slippage (ATR/volume-scaled)</td><td>{{ details.dynamic_slippage_pct | round(4) }}%</td></tr>
+      <tr><td>Latency (execution simulation)</td><td>{{ details.latency_ms | round(1) }} ms (signal &rarr; order routing)</td></tr>
       {% else %}
       <tr><td>Estimated dynamic slippage</td><td>{{ config.estimated_slippage }}</td></tr>
       <tr><td>Simulated execution delay (s)</td><td>{{ config.execution_delay_sec }}</td></tr>
       {% endif %}
-      <tr><td>Stop-loss rule</td><td>Exit on {{ (config.stop_loss * 100) | round(1) }}% adverse move</td></tr>
+      <tr><td>Per-bar stop-loss floor</td><td>Cap single-bar loss at {{ (config.stop_loss * 100) | round(1) }}%</td></tr>
+      <tr><td>Trailing stop</td><td>3&times; ATR (close-to-close)</td></tr>
     </table>
   </div>
 
@@ -141,16 +169,17 @@ _TEMPLATE = """<!DOCTYPE html>
     <p class="sub" style="margin-bottom:.5rem">Ranked by Profit Factor, then Sharpe Ratio.</p>
     <table>
       <tr>
-        <th>#</th><th>Strategy</th><th>Stop Loss</th><th>Profit Factor</th>
+        <th>#</th><th>Ticker</th><th>Strategy</th><th>Stop Loss</th><th>Profit Factor</th>
         <th>Sharpe</th><th>Sortino</th><th>Win Rate %</th><th>Total Return %</th>
         <th>CAGR %</th><th>Max Drawdown %</th><th>Status</th>
       </tr>
       {% for row in top10 %}
       <tr>
         <td>{{ loop.index }}</td>
+        <td>{{ row.ticker }}</td>
         <td>{{ row.strategy }}</td>
         <td>{{ row.stop_loss }}</td>
-        <td>{{ row.profit_factor | round(2) }}</td>
+        <td>{{ row.profit_factor | pf_display }}</td>
         <td>{{ row.sharpe | round(3) }}</td>
         <td>{{ row.sortino | round(3) }}</td>
         <td>{{ row.win_rate_pct | round(1) }}</td>
@@ -177,16 +206,17 @@ _TEMPLATE = """<!DOCTYPE html>
        No configuration satisfied the profitability / risk guardrails.</p>
     <table>
       <tr>
-        <th>#</th><th>Strategy</th><th>Stop Loss</th><th>Profit Factor</th>
+        <th>#</th><th>Ticker</th><th>Strategy</th><th>Stop Loss</th><th>Profit Factor</th>
         <th>Sharpe</th><th>Sortino</th><th>Win Rate %</th><th>Total Return %</th>
         <th>CAGR %</th><th>Max Drawdown %</th><th>Status</th>
       </tr>
       {% for row in top10 %}
       <tr>
         <td>{{ loop.index }}</td>
+        <td>{{ row.ticker }}</td>
         <td>{{ row.strategy }}</td>
         <td>{{ row.stop_loss }}</td>
-        <td>{{ row.profit_factor | round(2) }}</td>
+        <td>{{ row.profit_factor | pf_display }}</td>
         <td>{{ row.sharpe | round(3) }}</td>
         <td>{{ row.sortino | round(3) }}</td>
         <td>{{ row.win_rate_pct | round(1) }}</td>
@@ -359,6 +389,7 @@ def generate_dashboard(
     top10 = details.get("top10") if details is not None else None
 
     env = Environment(autoescape=True)
+    env.filters["pf_display"] = _pf_display
     template = env.from_string(_TEMPLATE)
     html = template.render(
         config=config,
@@ -373,5 +404,13 @@ def generate_dashboard(
 
     with open(output_path, "w", encoding="utf-8") as fh:
         fh.write(html)
+
+    # Also write the task-named institutional artifact (dashboard.html) so both
+    # the historical ``index.html`` (CI / Cloudflare deploy depend on it) and
+    # the requested ``output/dashboard.html`` exist with identical content.
+    if output_file != DASHBOARD_OUTPUT_FILE:
+        dashboard_path = os.path.join(output_dir, DASHBOARD_OUTPUT_FILE)
+        with open(dashboard_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
 
     return output_path

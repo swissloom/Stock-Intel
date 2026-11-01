@@ -30,6 +30,9 @@ DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_BACKOFF = 1.0  # seconds; doubled on each retry (capped).
 DEFAULT_MAX_BACKOFF = 30.0  # seconds; ceiling for the exponential backoff.
 
+# Default liquid benchmark universe scanned by the multi-ticker pipeline.
+DEFAULT_UNIVERSE = ("AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY")
+
 
 class DataFetchError(RuntimeError):
     """Raised when market data cannot be fetched or fails validation."""
@@ -157,3 +160,144 @@ def fetch_market_data(
         f"Failed to fetch market data for '{ticker}' after {max_retries} "
         f"attempt(s): {last_exc}"
     ) from last_exc
+
+
+def clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean a single normalized OHLCV frame for backtesting.
+
+    * Sorts by the DatetimeIndex (ascending).
+    * Drops exact-duplicate index rows (keeps the last).
+    * Forward-then-back fills interior gaps in the OHLC price columns, then
+      drops any rows that still carry a NaN ``Close`` (leading gaps with no
+      prior value to carry forward).
+    * Fills missing ``Volume`` with ``0.0``.
+
+    The function is pure (no network) so it is unit-testable offline.
+    """
+    out = df.copy()
+    out = out.sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+
+    price_cols = [c for c in ("Open", "High", "Low", "Close") if c in out.columns]
+    if price_cols:
+        out[price_cols] = out[price_cols].ffill().bfill()
+    if "Volume" in out.columns:
+        out["Volume"] = out["Volume"].fillna(0.0)
+
+    out = out.dropna(subset=["Close"])
+    return out
+
+
+def align_universe(frames: dict) -> dict:
+    """Align a mapping of ``{ticker: OHLCV DataFrame}`` onto a shared calendar.
+
+    All frames are reindexed onto the **intersection** of their DatetimeIndexes
+    (the set of dates for which every ticker has data), so cross-sectional and
+    comparative logic operates on genuinely contemporaneous bars. Each reindexed
+    frame is then cleaned via :func:`clean_ohlcv`.
+
+    Parameters
+    ----------
+    frames:
+        Mapping of ticker symbol -> cleaned/normalized OHLCV DataFrame. Empty
+        or ``None`` frames are ignored.
+
+    Returns
+    -------
+    dict
+        ``{ticker: aligned DataFrame}`` restricted to the shared date index.
+        Returns an empty dict when there is no common date range.
+    """
+    usable = {
+        t: f for t, f in frames.items()
+        if f is not None and len(f) > 0 and isinstance(f.index, pd.DatetimeIndex)
+    }
+    if not usable:
+        return {}
+
+    common_index = None
+    for frame in usable.values():
+        idx = frame.index
+        common_index = idx if common_index is None else common_index.intersection(idx)
+
+    if common_index is None or len(common_index) == 0:
+        return {}
+
+    common_index = common_index.sort_values()
+    aligned = {}
+    for ticker, frame in usable.items():
+        aligned[ticker] = clean_ohlcv(frame.reindex(common_index))
+    return aligned
+
+
+def fetch_universe(
+    tickers=DEFAULT_UNIVERSE,
+    start: str = "2020-01-01",
+    end: str = "2026-01-01",
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_backoff: float = DEFAULT_BASE_BACKOFF,
+    max_backoff: float = DEFAULT_MAX_BACKOFF,
+    downloader=None,
+    align: bool = True,
+) -> dict:
+    """Download, validate and (optionally) align a basket of tickers.
+
+    Each ticker is fetched through :func:`fetch_market_data`, so the per-ticker
+    HTTP 429 exponential-backoff retry logic (the project data standard) is
+    reused unchanged. A single ticker that fails all retries is skipped with a
+    warning rather than aborting the whole universe download, so one bad symbol
+    never sinks the run.
+
+    Parameters
+    ----------
+    tickers:
+        Iterable of ticker symbols. Defaults to :data:`DEFAULT_UNIVERSE`.
+    align:
+        When ``True`` (default) the surviving frames are reindexed onto their
+        shared trading calendar via :func:`align_universe` so every ticker is
+        aligned bar-for-bar.
+
+    Returns
+    -------
+    dict
+        ``{ticker: OHLCV DataFrame}`` for every ticker that downloaded and
+        validated successfully.
+
+    Raises
+    ------
+    DataFetchError
+        Only when **no** ticker in the basket could be fetched at all.
+    """
+    frames: dict = {}
+    errors: dict = {}
+    for ticker in tickers:
+        try:
+            frames[ticker] = fetch_market_data(
+                ticker,
+                start=start,
+                end=end,
+                max_retries=max_retries,
+                base_backoff=base_backoff,
+                max_backoff=max_backoff,
+                downloader=downloader,
+            )
+        except DataFetchError as exc:
+            errors[ticker] = str(exc)
+            print(f"[!] Skipping '{ticker}': {exc}")
+
+    if not frames:
+        raise DataFetchError(
+            f"Failed to fetch any ticker in the universe {list(tickers)}. "
+            f"Errors: {errors}"
+        )
+
+    if align:
+        frames = align_universe(frames)
+        if not frames:
+            raise DataFetchError(
+                "No overlapping trading dates across the fetched universe; "
+                "cannot align the basket onto a shared calendar."
+            )
+
+    return frames

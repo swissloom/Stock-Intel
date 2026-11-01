@@ -225,6 +225,167 @@ def dynamic_slippage(volatility: float, base_slippage: float = 0.001) -> float:
     return base_slippage * (1.0 + volatility * 10.0)
 
 
+# Minimum profit factor a configuration must clear to be eligible for
+# selection. Configs below this are disqualified (institutional guardrail).
+MIN_PROFIT_FACTOR = 1.3
+
+
+def compute_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
+    """True-range based Average True Range (ATR).
+
+    Uses the classic True Range definition
+    ``max(high-low, |high-prev_close|, |low-prev_close|)`` smoothed by a simple
+    rolling mean over ``period`` bars. Pure / offline.
+    """
+    high = data["High"]
+    low = data["Low"]
+    prev_close = data["Close"].shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def dynamic_slippage_atr(
+    atr: float,
+    price: float,
+    volume: float,
+    avg_volume: float,
+    base_slippage: float = 0.001,
+) -> float:
+    """ATR- and volume-scaled transaction-cost model.
+
+    Slippage widens with relative ATR (volatility of the bar as a fraction of
+    price) and with thin liquidity (current volume below its average):
+
+        ``atr_frac   = atr / price``                     (0 when price <= 0)
+        ``liq_factor = clip(avg_volume / volume, 1, 5)`` (thin -> up to 5x)
+        ``slippage   = base_slippage * (1 + 10 * atr_frac) * liq_factor``
+
+    Lower-than-average volume increases cost (harder to fill); higher volume is
+    floored at the base (``liq_factor`` >= 1) so ample liquidity never discounts
+    below the base cost. All inputs are scalars so the function stays pure and
+    directly testable. Non-finite / degenerate inputs fall back safely.
+    """
+    atr_frac = (atr / price) if (price and price > 0 and np.isfinite(atr)) else 0.0
+    if atr_frac < 0 or not np.isfinite(atr_frac):
+        atr_frac = 0.0
+
+    if volume and volume > 0 and avg_volume and avg_volume > 0:
+        liq_factor = float(np.clip(avg_volume / volume, 1.0, 5.0))
+    else:
+        liq_factor = 1.0
+
+    return base_slippage * (1.0 + 10.0 * atr_frac) * liq_factor
+
+
+def atr_position_size(
+    equity: float,
+    atr: float,
+    price: float,
+    risk_per_trade: float = 0.01,
+    max_fraction: float = 1.0,
+) -> float:
+    """ATR-based volatility position sizing, returned as a fraction of equity.
+
+    Risks a fixed fraction of ``equity`` (``risk_per_trade``) against a stop set
+    at ``atr`` distance, then expresses the resulting notional as a fraction of
+    equity (``0 <= fraction <= max_fraction``):
+
+        ``units          = (equity * risk_per_trade) / atr``
+        ``notional       = units * price``
+        ``fraction       = clip(notional / equity, 0, max_fraction)``
+
+    Higher ATR (more volatile) -> smaller position; lower ATR -> larger (capped
+    at ``max_fraction``). Degenerate inputs (non-positive atr/price/equity)
+    return ``0.0``. Pure / offline.
+    """
+    if not (atr and atr > 0 and price and price > 0 and equity and equity > 0):
+        return 0.0
+    units = (equity * risk_per_trade) / atr
+    notional = units * price
+    fraction = notional / equity
+    return float(np.clip(fraction, 0.0, max_fraction))
+
+
+def apply_trailing_stop(
+    signal: pd.Series,
+    close: pd.Series,
+    atr: pd.Series,
+    atr_multiple: float = 3.0,
+) -> pd.Series:
+    """Apply a 3x-ATR (configurable) trailing stop to a long/flat signal.
+
+    While the input ``signal`` is long (1), a trailing stop is maintained at
+    ``peak_close - atr_multiple * ATR`` where ``peak_close`` is the highest
+    close seen since entry. When ``Close`` closes at or below that stop the
+    position is forced flat (0) from the next bar onward and stays flat until
+    the original signal exits and re-enters (a fresh 0 -> 1 transition), which
+    re-arms the stop for the new trade.
+
+    Returns a new integer position series (1 = long, 0 = flat) aligned with the
+    inputs. Pure / offline; the trailing stop is evaluated on a close-to-close
+    basis (no intra-bar trigger), consistent with the project's per-bar P&L
+    convention.
+    """
+    sig = pd.Series(signal).fillna(0).astype(int).to_numpy()
+    px = pd.Series(close).astype(float).to_numpy()
+    atr_arr = pd.Series(atr).astype(float).to_numpy()
+    n = min(len(sig), len(px), len(atr_arr))
+
+    out = np.zeros(n, dtype=int)
+    in_trade = False
+    peak = -np.inf
+    stopped_this_trade = False
+
+    for i in range(n):
+        want_long = sig[i] == 1
+
+        if not want_long:
+            # Signal flat -> definitely flat; reset trade state.
+            in_trade = False
+            stopped_this_trade = False
+            out[i] = 0
+            continue
+
+        # Signal wants long.
+        if not in_trade and not stopped_this_trade:
+            # Fresh entry: arm the stop.
+            in_trade = True
+            peak = px[i]
+            out[i] = 1
+            continue
+
+        if stopped_this_trade:
+            # Stopped out earlier within this same signal-long run; stay flat
+            # until the signal exits (handled by the `not want_long` branch).
+            out[i] = 0
+            continue
+
+        # Continuing an active trade: update peak and test the trailing stop.
+        if np.isfinite(px[i]):
+            peak = max(peak, px[i])
+        stop_level = (
+            peak - atr_multiple * atr_arr[i]
+            if np.isfinite(atr_arr[i])
+            else -np.inf
+        )
+        if np.isfinite(px[i]) and px[i] <= stop_level:
+            # Trailing stop hit: exit (flat from this bar).
+            in_trade = False
+            stopped_this_trade = True
+            out[i] = 0
+        else:
+            out[i] = 1
+
+    return pd.Series(out, index=pd.Series(close).index[:n])
+
+
 def simulate_latency(base_delay: float = 0.5, jitter: float = 0.2) -> float:
     """Simulate real-world execution delay between signal and order routing.
 

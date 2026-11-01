@@ -889,3 +889,348 @@ def test_generate_dashboard_single_curve_fallback(tmp_path):
         html = fh.read()
     assert html.count("<polyline") == 1
     assert "https://" not in html and "<script" not in html
+
+
+# ===========================================================================
+# Multi-ticker universe & multi-factor rebuild (new institutional features)
+# ===========================================================================
+from src.data_fetcher import (  # noqa: E402
+    DEFAULT_UNIVERSE,
+    align_universe,
+    clean_ohlcv,
+    fetch_universe,
+)
+from src.risk_engine import (  # noqa: E402
+    MIN_PROFIT_FACTOR,
+    apply_trailing_stop,
+    atr_position_size,
+    compute_atr,
+    dynamic_slippage_atr,
+)
+from src.strategies import multifactor_score  # noqa: E402
+from src.optimizer import optimize_universe  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# data_fetcher: clean_ohlcv / align_universe / fetch_universe (offline)
+# ---------------------------------------------------------------------------
+def test_clean_ohlcv_sorts_dedupes_and_fills():
+    idx = pd.to_datetime(
+        ["2020-01-03", "2020-01-02", "2020-01-02", "2020-01-06"]
+    )
+    df = pd.DataFrame(
+        {
+            "Open": [10.0, 9.0, 9.5, np.nan],
+            "High": [11.0, 10.0, 10.5, 12.0],
+            "Low": [9.0, 8.0, 8.5, 10.0],
+            "Close": [10.5, 9.5, 9.8, np.nan],
+            "Volume": [1e6, np.nan, 2e6, 3e6],
+        },
+        index=idx,
+    )
+    out = clean_ohlcv(df)
+    # Sorted ascending and de-duplicated (keeps last of the dup date).
+    assert list(out.index) == sorted(out.index)
+    assert out.index.is_unique
+    # NaN Close on the last row is forward-filled (not dropped) because a prior
+    # value exists to carry forward.
+    assert out["Close"].isna().sum() == 0
+    # Missing volume filled with 0.
+    assert (out["Volume"].isna().sum()) == 0
+
+
+def test_align_universe_intersects_calendars():
+    a = _ohlcv_from_close(100.0 + np.arange(10), start="2020-01-01")
+    b = _ohlcv_from_close(50.0 + np.arange(8), start="2020-01-03")
+    aligned = align_universe({"A": a, "B": b})
+    assert set(aligned.keys()) == {"A", "B"}
+    # Both frames share the exact same (intersected) index.
+    assert aligned["A"].index.equals(aligned["B"].index)
+    assert len(aligned["A"]) == len(aligned["B"])
+    assert len(aligned["A"]) > 0
+
+
+def test_align_universe_empty_on_no_overlap():
+    a = _ohlcv_from_close(100.0 + np.arange(5), start="2020-01-01")
+    b = _ohlcv_from_close(100.0 + np.arange(5), start="2025-01-01")
+    assert align_universe({"A": a, "B": b}) == {}
+
+
+def test_fetch_universe_skips_bad_ticker_no_network():
+    good = _multiindex_frame("AAPL", n=30)
+
+    def downloader(ticker, start=None, end=None):
+        if ticker == "BAD":
+            raise RuntimeError("delisted / no data")
+        return good
+
+    frames = fetch_universe(
+        ["AAPL", "BAD", "MSFT"],
+        downloader=downloader,
+        base_backoff=0.0,
+        max_backoff=0.0,
+        align=False,
+    )
+    # The bad ticker is skipped; the good ones survive.
+    assert set(frames.keys()) == {"AAPL", "MSFT"}
+
+
+def test_fetch_universe_raises_when_all_fail():
+    def downloader(ticker, start=None, end=None):
+        raise RuntimeError("total outage")
+
+    with pytest.raises(DataFetchError):
+        fetch_universe(
+            ["AAPL", "MSFT"],
+            downloader=downloader,
+            base_backoff=0.0,
+            max_backoff=0.0,
+        )
+
+
+def test_default_universe_is_the_benchmark_basket():
+    assert set(DEFAULT_UNIVERSE) == {
+        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "SPY"
+    }
+
+
+# ---------------------------------------------------------------------------
+# strategies: MultiFactor model
+# ---------------------------------------------------------------------------
+def test_multifactor_score_components():
+    # Rising series: positive 6m momentum, above 200-SMA, low vol.
+    n = 400
+    close = 100.0 + np.arange(n) * 1.0
+    df = _ohlcv_from_close(close)
+    factors = multifactor_score(df)
+    for col in ("momentum", "above_sma", "vol_ann", "vol_ok"):
+        assert col in factors.columns
+    # Well past warmup the trend filter is satisfied on a steady uptrend.
+    assert bool(factors["above_sma"].iloc[-1])
+    # Momentum factor is finite and positive late in a strong uptrend.
+    assert np.isfinite(factors["momentum"].iloc[-1])
+    assert factors["momentum"].iloc[-1] > 0
+
+
+def test_multifactor_signal_long_on_clean_uptrend():
+    n = 400
+    close = 100.0 + np.arange(n) * 1.0
+    df = _ohlcv_from_close(close)
+    out = apply_strategy(df, "MultiFactor")
+    assert "Signal" in out.columns
+    assert set(np.unique(out["Signal"])).issubset({0, 1})
+    # A low-volatility, above-trend, positive-momentum tail must be long.
+    assert out["Signal"].iloc[-1] == 1
+
+
+def test_multifactor_signal_flat_on_downtrend():
+    n = 400
+    close = 800.0 - np.arange(n) * 1.0
+    df = _ohlcv_from_close(close)
+    out = apply_strategy(df, "MultiFactor")
+    # Below its 200-SMA and negative momentum -> never long.
+    assert (out["Signal"] == 0).all()
+
+
+def test_multifactor_signal_flat_when_volatility_extreme():
+    # Upward drift but extreme volatility (>50% annualized) must be filtered.
+    rng = np.random.default_rng(0)
+    n = 400
+    # Large daily swings -> very high annualized vol.
+    steps = rng.normal(0.5, 15.0, n)
+    close = 500.0 + np.cumsum(steps)
+    close = np.maximum(close, 20.0)
+    df = _ohlcv_from_close(close)
+    factors = multifactor_score(df)
+    # Where volatility exceeds the 50% cap, vol_ok is False and so is the long.
+    out = apply_strategy(df, "MultiFactor")
+    extreme = ~factors["vol_ok"].fillna(False)
+    # Every extreme-vol bar must be flat regardless of momentum/trend.
+    assert (out["Signal"][extreme] == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# risk_engine: ATR, ATR slippage, ATR sizing, trailing stop, PF guardrail
+# ---------------------------------------------------------------------------
+def test_compute_atr_positive_and_warmup_nan():
+    df = _ohlcv_from_close(100.0 + np.arange(60) * 0.5)
+    atr = compute_atr(df, period=14)
+    assert atr.iloc[:13].isna().all()  # warmup
+    assert np.isfinite(atr.iloc[-1]) and atr.iloc[-1] > 0
+
+
+def test_dynamic_slippage_atr_scales_with_atr_and_thin_volume():
+    base = 0.001
+    low_atr = dynamic_slippage_atr(1.0, 100.0, 1e6, 1e6, base_slippage=base)
+    high_atr = dynamic_slippage_atr(5.0, 100.0, 1e6, 1e6, base_slippage=base)
+    # Wider ATR -> larger slippage.
+    assert high_atr > low_atr
+    # Thin volume (below average) widens slippage further.
+    ample = dynamic_slippage_atr(2.0, 100.0, 2e6, 1e6, base_slippage=base)
+    thin = dynamic_slippage_atr(2.0, 100.0, 5e5, 1e6, base_slippage=base)
+    assert thin > ample
+    # Ample volume never discounts below base (liq_factor floored at 1).
+    assert ample >= dynamic_slippage_atr(0.0, 100.0, 2e6, 1e6, base_slippage=base)
+
+
+def test_dynamic_slippage_atr_degenerate_inputs_safe():
+    # Zero / invalid price or volume must not raise and returns a finite cost.
+    val = dynamic_slippage_atr(1.0, 0.0, 0.0, 0.0, base_slippage=0.001)
+    assert np.isfinite(val) and val >= 0.001
+
+
+def test_atr_position_size_inverse_to_volatility():
+    small = atr_position_size(equity=100_000, atr=5.0, price=100.0)
+    large = atr_position_size(equity=100_000, atr=1.0, price=100.0)
+    # Lower ATR -> larger position fraction.
+    assert large > small
+    # Bounded in [0, 1].
+    assert 0.0 <= small <= 1.0 and 0.0 <= large <= 1.0
+    # Degenerate inputs -> 0.
+    assert atr_position_size(0, 1.0, 100.0) == 0.0
+    assert atr_position_size(100_000, 0.0, 100.0) == 0.0
+
+
+def test_apply_trailing_stop_exits_on_drawdown():
+    # Rise then sharp fall; a 3x-ATR trailing stop must force flat on the drop.
+    close = pd.Series([100, 102, 104, 106, 108, 90, 88, 86], dtype=float)
+    atr = pd.Series([2.0] * len(close))
+    signal = pd.Series([1, 1, 1, 1, 1, 1, 1, 1])  # signal always wants long
+    held = apply_trailing_stop(signal, close, atr, atr_multiple=3.0)
+    # Early bars (uptrend) are long.
+    assert held.iloc[1] == 1
+    # The 90 close is below peak(108) - 3*2 = 102 -> stop triggers flat.
+    assert held.iloc[5] == 0
+    # Stays flat for the remainder of this signal-long run.
+    assert (held.iloc[5:] == 0).all()
+
+
+def test_apply_trailing_stop_rearms_after_signal_exit():
+    # Stop out, signal goes flat, then re-enters -> stop re-arms (long again).
+    close = pd.Series([100, 110, 80, 80, 82, 90, 95], dtype=float)
+    atr = pd.Series([2.0] * len(close))
+    #            idx: 0    1    2    3    4    5    6
+    signal = pd.Series([1, 1, 1, 0, 1, 1, 1])
+    held = apply_trailing_stop(signal, close, atr, atr_multiple=3.0)
+    # Bar 2 (80) is below 110 - 6 = 104 -> stopped flat.
+    assert held.iloc[2] == 0
+    # Bar 3 signal flat -> flat.
+    assert held.iloc[3] == 0
+    # Bar 4 re-entry (fresh 0->1) re-arms and goes long again.
+    assert held.iloc[4] == 1
+
+
+def test_min_profit_factor_constant():
+    assert MIN_PROFIT_FACTOR == 1.3
+
+
+# ---------------------------------------------------------------------------
+# optimizer: optimize_universe (offline, injected frames)
+# ---------------------------------------------------------------------------
+def test_optimize_universe_offline_selects_from_basket():
+    # Build two synthetic tickers: one strong clean uptrend, one downtrend.
+    up = _ohlcv_from_close(100.0 + np.arange(900) * 1.0)
+    down = _ohlcv_from_close(900.0 - np.arange(900) * 0.5)
+    frames = {"UP": up, "DOWN": down}
+
+    best, equity_curve, details = optimize_universe(
+        tickers=["UP", "DOWN"],
+        strategy_names=["MultiFactor", "Momentum"],
+        stop_loss_range=[0.05, 0.1],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        frames=frames,
+    )
+    # Details always carry the universe + combined leaderboard.
+    assert "universe" in details and set(details["universe"]) == {"UP", "DOWN"}
+    assert "universe_sweep" in details and len(details["universe_sweep"]) > 0
+    assert len(details["top10"]) <= 10
+    # Leaderboard ranked by profit factor then sharpe (desc).
+    pfs = [(e["profit_factor"], e["sharpe"]) for e in details["top10"]]
+    assert pfs == sorted(pfs, reverse=True)
+    # If a winner exists it must come from the basket and satisfy guardrails.
+    if best is not None:
+        assert best["ticker"] in {"UP", "DOWN"}
+        assert details["total_return_pct"] > 0
+        assert details["profit_factor"] >= MIN_PROFIT_FACTOR
+        assert isinstance(equity_curve, list) and len(equity_curve) >= 2
+
+
+def test_optimize_universe_honest_empty_state():
+    # A basket of only falling series: nothing should qualify, but the
+    # leaderboard is still populated (honest empty state, no fabrication).
+    down1 = _ohlcv_from_close(900.0 - np.arange(900) * 0.5)
+    down2 = _ohlcv_from_close(500.0 - np.arange(900) * 0.3)
+    best, equity_curve, details = optimize_universe(
+        tickers=["D1", "D2"],
+        strategy_names=["MultiFactor", "Momentum"],
+        stop_loss_range=[0.05],
+        train_window_years=2,
+        test_window_years=1,
+        latency_base_delay=0.0,
+        latency_jitter=0.0,
+        frames={"D1": down1, "D2": down2},
+    )
+    assert best is None
+    assert equity_curve is None
+    assert len(details["universe_sweep"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# dashboard: dashboard.html artifact is written alongside index.html
+# ---------------------------------------------------------------------------
+def test_generate_dashboard_writes_both_artifacts(tmp_path):
+    from src.dashboard_generator import (
+        DASHBOARD_OUTPUT_FILE,
+        DEFAULT_OUTPUT_FILE,
+        generate_dashboard,
+    )
+
+    details = _synthetic_details()
+    # Give every sweep/top10 row a ticker so the leaderboard column renders.
+    path = generate_dashboard(
+        _best_config(),
+        equity_curve=[0.0, 0.08, 0.15, 0.28, 0.345],
+        output_dir=str(tmp_path),
+        details=details,
+        benchmark_curve=details["benchmark_equity_curve"],
+    )
+    # Returns the index.html path (unchanged contract) ...
+    assert path.endswith(DEFAULT_OUTPUT_FILE)
+    # ... but BOTH artifacts exist with identical, non-empty content.
+    dash = os.path.join(str(tmp_path), DASHBOARD_OUTPUT_FILE)
+    assert os.path.exists(dash) and os.path.getsize(dash) > 0
+    with open(path, encoding="utf-8") as fh:
+        index_html = fh.read()
+    with open(dash, encoding="utf-8") as fh:
+        dash_html = fh.read()
+    assert index_html == dash_html
+    # Optimal Ticker + Sortino are present in the summary grid.
+    assert "Optimal Ticker" in index_html
+    assert "Sortino" in index_html
+    # Ticker column present in the leaderboard.
+    assert "<th>Ticker</th>" in index_html
+
+
+def test_dashboard_pf_sentinel_renders_as_infinity(tmp_path):
+    """The 1e9 'no losing trades' sentinel must not leak as a raw billion."""
+    from src.dashboard_generator import generate_dashboard
+    from src.risk_engine import PROFIT_FACTOR_NO_LOSS
+
+    details = _synthetic_details()
+    details["profit_factor"] = PROFIT_FACTOR_NO_LOSS
+    details["top10"][0]["profit_factor"] = PROFIT_FACTOR_NO_LOSS
+    path = generate_dashboard(
+        _best_config(),
+        equity_curve=[0.0, 0.1, 0.2, 0.3],
+        output_dir=str(tmp_path),
+        details=details,
+        benchmark_curve=details["benchmark_equity_curve"],
+    )
+    with open(path, encoding="utf-8") as fh:
+        html = fh.read()
+    # No raw sentinel billion anywhere; an explicit "no losing trades" marker.
+    assert "1000000000" not in html
+    assert "no losing trades" in html
