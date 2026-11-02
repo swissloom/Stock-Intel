@@ -34,10 +34,22 @@ stop_loss_range:
 train_window_years: 2
 test_window_years: 1
 
-# Historical data range for the live download.
+# Historical data range for the live download. A 5+ year multi-year regime
+# window spanning the 2020 COVID crash, the 2022 bear market / rate-hike cycle,
+# and the 2023-2024 bull run, through the latest available trading day.
 date_range:
   start: "2020-01-01"
-  end: "2026-01-01"
+  end: "2026-11-01"
+
+# Multi-asset portfolio allocation across the top-N qualifying assets.
+portfolio:
+  # Number of top-ranked qualifying assets to hold (fewer if fewer qualify).
+  top_n: 3
+  # Weighting scheme: "inverse_vol" (volatility parity) or "equal".
+  weighting: inverse_vol
+  # Benchmark for the comparison equity curve: a ticker (e.g. SPY) or
+  # "equal_weight" for an equal-weight basket of the whole universe.
+  benchmark: SPY
 
 # Risk budgeting thresholds.
 risk:

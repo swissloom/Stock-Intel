@@ -94,7 +94,72 @@ _TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Stock-Intel &mdash; Quantitative Strategy Optimization</h1>
-  <div class="sub">Generated {{ generated_at }} &middot; Walk-forward backtest report</div>
+  <div class="sub">Generated {{ generated_at }} &middot; Multi-year, multi-asset portfolio backtest report</div>
+
+  {% if portfolio and portfolio.selected %}
+  <div class="section">
+    <h2>Multi-Asset Portfolio &mdash; {{ portfolio.weighting | replace("_", " ") | title }} Allocation</h2>
+    <div class="sub" style="margin-bottom:1rem">
+      Holding {{ portfolio.selected | length }} of {{ portfolio.n_qualifying }} qualifying asset(s)
+      &middot; {{ portfolio.period_start }} &rarr; {{ portfolio.period_end }}
+      &middot; {{ portfolio.n_periods }} trading days
+    </div>
+    <div class="grid">
+      <div class="card"><div class="label">Portfolio Basket</div>
+        <div class="value" style="font-size:1.1rem">{{ portfolio.selected | join(" + ") }}</div></div>
+      <div class="card"><div class="label">Portfolio CAGR (geometric)</div>
+        <div class="value {{ 'pos' if portfolio.cagr_pct >= 0 else 'neg' }}">{{ portfolio.cagr_pct | round(2) }}%</div></div>
+      <div class="card"><div class="label">Total Return</div>
+        <div class="value {{ 'pos' if portfolio.total_return_pct >= 0 else 'neg' }}">{{ portfolio.total_return_pct | round(2) }}%</div></div>
+      <div class="card"><div class="label">Benchmark ({{ portfolio.benchmark }})</div>
+        <div class="value {{ 'pos' if portfolio.benchmark_total_return_pct >= 0 else 'neg' }}">{{ portfolio.benchmark_total_return_pct | round(2) }}%</div></div>
+      <div class="card"><div class="label">Sharpe Ratio</div>
+        <div class="value {{ 'pos' if portfolio.sharpe >= 0 else 'neg' }}">{{ portfolio.sharpe | round(2) }}</div></div>
+      <div class="card"><div class="label">Sortino Ratio</div>
+        <div class="value {{ 'pos' if portfolio.sortino >= 0 else 'neg' }}">{{ portfolio.sortino | round(2) }}</div></div>
+      <div class="card"><div class="label">Max Drawdown</div>
+        <div class="value neg">{{ (portfolio.max_drawdown * 100) | round(2) }}%</div></div>
+    </div>
+
+    {% if portfolio_svg %}
+    <h2 style="margin-top:1rem">Portfolio Cumulative Return vs. Benchmark</h2>
+    {% if portfolio_bench_present %}
+    <div class="legend">
+      <span><span class="swatch" style="background:{{ strategy_colour }}"></span>Portfolio ({{ portfolio.weighting | replace("_", " ") }})</span>
+      <span><span class="swatch" style="background:{{ benchmark_colour }}"></span>{{ portfolio.benchmark }} Benchmark</span>
+    </div>
+    {% endif %}
+    {{ portfolio_svg | safe }}
+    {% endif %}
+
+    <h2 style="margin-top:1.25rem">Allocation Breakdown</h2>
+    <table>
+      <tr>
+        <th>Asset</th><th>Weight %</th><th>Individual Sharpe</th>
+        <th>Individual Total Return %</th><th>Contribution to Return %</th>
+        <th>Slippage %</th>
+      </tr>
+      {% for a in portfolio.allocation %}
+      <tr>
+        <td>{{ a.ticker }}</td>
+        <td>{{ a.weight_pct | round(2) }}</td>
+        <td class="{{ 'pos' if a.sharpe >= 0 else 'neg' }}">{{ a.sharpe | round(3) }}</td>
+        <td class="{{ 'pos' if a.individual_total_return_pct >= 0 else 'neg' }}">{{ a.individual_total_return_pct | round(2) }}</td>
+        <td class="{{ 'pos' if a.contribution_pct >= 0 else 'neg' }}">{{ a.contribution_pct | round(2) }}</td>
+        <td>{{ a.slippage_pct | round(4) }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% elif portfolio %}
+  <div class="section">
+    <h2>Multi-Asset Portfolio</h2>
+    <p class="empty">No asset in the universe cleared the profitability / risk
+       guardrails over the tested window, so no portfolio was allocated.</p>
+    <p>This is the honest empty state &mdash; the engine does not fabricate a
+       basket. See the full leaderboard below for every tested configuration.</p>
+  </div>
+  {% endif %}
 
   {% if config %}
   <div class="grid">
@@ -345,6 +410,7 @@ def generate_dashboard(
     output_file: str = DEFAULT_OUTPUT_FILE,
     details: dict | None = None,
     benchmark_curve=None,
+    portfolio: dict | None = None,
 ) -> str:
     """Render the self-contained HTML dashboard and return its file path.
 
@@ -388,6 +454,21 @@ def generate_dashboard(
     benchmark_present = len(_clean_series(bench)) >= 2 and equity_svg != ""
     top10 = details.get("top10") if details is not None else None
 
+    # When a multi-asset portfolio payload is supplied, the main equity chart
+    # plots the compounded PORTFOLIO curve vs. its benchmark (overriding the
+    # per-ticker curve), and the portfolio summary grid + allocation table are
+    # rendered. Portfolio curves are compounded (base ~1.0), so they are drawn
+    # on their own shared scale by the same SVG helper.
+    portfolio_svg = ""
+    portfolio_bench_present = False
+    if portfolio is not None and portfolio.get("equity_curve"):
+        p_equity = portfolio.get("equity_curve")
+        p_bench = portfolio.get("benchmark_equity_curve")
+        portfolio_svg = _build_equity_svg(p_equity, benchmark_curve=p_bench)
+        portfolio_bench_present = (
+            len(_clean_series(p_bench)) >= 2 and portfolio_svg != ""
+        )
+
     env = Environment(autoescape=True)
     env.filters["pf_display"] = _pf_display
     template = env.from_string(_TEMPLATE)
@@ -399,6 +480,9 @@ def generate_dashboard(
         strategy_colour=_STRATEGY_COLOUR,
         benchmark_colour=_BENCHMARK_COLOUR,
         top10=top10,
+        portfolio=portfolio,
+        portfolio_svg=portfolio_svg,
+        portfolio_bench_present=portfolio_bench_present,
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
 

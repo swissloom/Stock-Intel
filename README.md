@@ -39,13 +39,43 @@ The flagship strategy combines three factors into a binary long/flat signal
 * **Performance guardrails:** any permutation with a negative Total Return or a
   Profit Factor below 1.3 is disqualified from selection.
 
+### Multi-year regime window & multi-asset portfolio
+
+The default backtest spans a **5+ year multi-year regime window**
+(`2020-01-01` -> `2026-11-01`): the 2020 COVID crash, the 2022 bear market /
+rate-hike cycle, and the 2023-2024 bull run. The 200-day SMA trend gate and the
+21-day annualized-volatility gate are what carry the multi-factor model through
+those regime shifts.
+
+Rather than concentrating 100% in a single ticker, the allocator (
+`allocate_portfolio` in `src/optimizer.py`) **ranks the universe, selects the
+top-N qualifying assets** (default N=3, by the walk-forward objective after the
+PF >= 1.3 / drawdown / profitability guardrails), and builds a diversified
+portfolio:
+
+* **Weighting:** `inverse_vol` (volatility parity - lower-vol assets get more
+  capital) or `equal`, configurable under `portfolio.weighting`.
+* **Compounded equity curve:** the portfolio uses the institutionally-correct
+  **geometric** convention (`(1 + r).cumprod()`) with
+  `CAGR = (Ending / Beginning) ** (1 / Years) - 1`. This is intentionally
+  separate (in `src/portfolio.py`) from the per-ticker *additive* walk-forward
+  engine, whose convention and test contract are left untouched.
+* **Benchmark:** a compounded Buy & Hold of `portfolio.benchmark` (default
+  `SPY`) or an `equal_weight` basket of the whole universe.
+
+The dashboard adds a **Portfolio Summary Grid** (Portfolio CAGR, Total Return,
+Sharpe, Sortino, Max Drawdown, benchmark comparison), an **Allocation
+Breakdown** table (each asset's weight, individual Sharpe, individual total
+return, and contribution), and plots the **portfolio cumulative return vs. the
+benchmark**.
+
 ### Honesty note
 
 The engine is **not** tuned to produce green reports. Guardrails only ever
-*reject* configurations; they never fabricate a winner. If no configuration in
-the entire universe clears the profitability / risk bar, the dashboard renders
-an honest empty state alongside the full leaderboard. The numbers shown reflect
-the exact mathematical reality of the downloaded data.
+*reject* configurations; they never fabricate a winner or a basket. If no asset
+in the universe clears the profitability / risk bar, the dashboard renders an
+honest empty portfolio state alongside the full leaderboard. The numbers shown
+reflect the exact mathematical reality of the downloaded data.
 
 ### Stop-loss handling
 
@@ -73,9 +103,10 @@ Stock-Intel/
 ├── src/
 │   ├── __init__.py
 │   ├── data_fetcher.py                  # Download + validate (429 backoff)
-│   ├── strategies.py                    # Signal library (Momentum, Bollinger)
-│   ├── risk_engine.py                   # Slippage, latency, regime, metrics
-│   ├── optimizer.py                     # Walk-forward optimization engine
+│   ├── strategies.py                    # Signal library (MultiFactor, Momentum, Bollinger)
+│   ├── risk_engine.py                   # ATR slippage, trailing stop, latency, regime, metrics
+│   ├── optimizer.py                     # Walk-forward + universe + portfolio allocator
+│   ├── portfolio.py                     # Compounded multi-asset portfolio (CAGR, weighting)
 │   └── dashboard_generator.py           # Self-contained HTML report
 ├── tests/test_pipeline.py               # Offline unit tests
 ├── main.py                              # CLI entrypoint

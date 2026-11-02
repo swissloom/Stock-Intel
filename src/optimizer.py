@@ -12,6 +12,16 @@ import numpy as np
 import pandas as pd
 
 from src.data_fetcher import DEFAULT_UNIVERSE, fetch_market_data, fetch_universe
+from src.portfolio import (
+    build_portfolio,
+    compounded_equity_curve,
+    daily_strategy_returns,
+    equal_weights,
+    geometric_cagr,
+    inverse_volatility_weights,
+    portfolio_metrics,
+    total_return_compounded,
+)
 from src.risk_engine import (
     MIN_PROFIT_FACTOR,
     apply_trailing_stop,
@@ -541,3 +551,284 @@ def optimize_universe(
     print("==========================================\n")
 
     return best_config, best_equity_curve, details
+
+
+# Default portfolio construction parameters.
+DEFAULT_TOP_N = 3
+DEFAULT_WEIGHTING = "inverse_vol"
+DEFAULT_BENCHMARK = "SPY"
+
+
+def _best_qualifying_per_ticker(combined_sweep: list) -> dict:
+    """Pick each ticker's single best *qualifying* sweep row.
+
+    A row qualifies when it is not flagged ``unprofitable`` and clears the
+    profit-factor guardrail (``profit_factor >= MIN_PROFIT_FACTOR``). Among a
+    ticker's qualifying rows the one with the highest ``objective`` is kept.
+
+    Returns ``{ticker: sweep_row}`` for every ticker with at least one
+    qualifying configuration.
+    """
+    best: dict = {}
+    for row in combined_sweep:
+        if row.get("unprofitable"):
+            continue
+        if row.get("profit_factor", 0.0) < MIN_PROFIT_FACTOR:
+            continue
+        t = row["ticker"]
+        if t not in best or row.get("objective", -np.inf) > best[t].get(
+            "objective", -np.inf
+        ):
+            best[t] = row
+    return best
+
+
+def allocate_portfolio(
+    tickers=DEFAULT_UNIVERSE,
+    strategy_names=None,
+    stop_loss_range=None,
+    train_window_years: int = 2,
+    test_window_years: int = 1,
+    *,
+    start: str = DEFAULT_START,
+    end: str = DEFAULT_END,
+    base_slippage: float = DEFAULT_BASE_SLIPPAGE,
+    max_drawdown_limit: float = DEFAULT_MAX_DRAWDOWN_LIMIT,
+    latency_base_delay: float = DEFAULT_LATENCY_BASE_DELAY,
+    latency_jitter: float = DEFAULT_LATENCY_JITTER,
+    top_n: int = DEFAULT_TOP_N,
+    weighting: str = DEFAULT_WEIGHTING,
+    benchmark: str = DEFAULT_BENCHMARK,
+    frames: dict | None = None,
+):
+    """Rank the universe, select the top-N qualifying assets, and allocate.
+
+    This is the multi-asset portfolio allocator. It:
+
+    1. Runs :func:`optimize_universe` to rank every ticker (reusing the
+       walk-forward guardrails: max-drawdown limit, Total Return > 0, and
+       Profit Factor >= :data:`~src.risk_engine.MIN_PROFIT_FACTOR`).
+    2. Selects up to ``top_n`` qualifying assets (by the walk-forward
+       objective). Fewer are held when fewer qualify; none means an honest
+       empty portfolio.
+    3. Builds each selected asset's **daily** ``MultiFactor`` strategy returns
+       on the shared (aligned) calendar, net of dynamic slippage.
+    4. Weights them by ``inverse_vol`` (volatility parity) or ``equal``.
+    5. Combines them into a single **geometrically compounded** portfolio
+       equity curve ``(1 + r).cumprod()`` and computes the geometric CAGR,
+       Sharpe/Sortino and max drawdown, alongside a benchmark curve.
+
+    Parameters
+    ----------
+    frames:
+        Optional pre-fetched, aligned ``{ticker: OHLCV DataFrame}`` mapping for
+        offline testing. Otherwise the universe is downloaded + aligned via
+        :func:`optimize_universe` -> :func:`fetch_universe`.
+    benchmark:
+        A ticker symbol (e.g. ``"SPY"``) or ``"equal_weight"`` for an
+        equal-weight Buy & Hold basket of the full evaluated universe.
+
+    Returns
+    -------
+    dict
+        A ``portfolio`` payload (see keys inline) including the compounded
+        ``equity_curve``, ``benchmark_equity_curve``, headline metrics, the
+        per-asset ``allocation`` breakdown (weight, individual Sharpe,
+        contribution to total return), plus the underlying universe ``details``
+        (leaderboard etc.) for the dashboard.
+    """
+    if strategy_names is None:
+        strategy_names = ["MultiFactor", "Momentum", "Bollinger_Squeeze"]
+    if stop_loss_range is None:
+        stop_loss_range = [0.02, 0.05, 0.08]
+
+    # Fetch + align once; reuse for both ranking and portfolio construction.
+    if frames is None:
+        print(f"[*] Downloading universe for portfolio: {list(tickers)}...")
+        frames = fetch_universe(tickers, start=start, end=end)
+
+    # Step 1-2: rank the universe and read the per-ticker qualifying winners.
+    _, _, details = optimize_universe(
+        tickers=tickers,
+        strategy_names=strategy_names,
+        stop_loss_range=stop_loss_range,
+        train_window_years=train_window_years,
+        test_window_years=test_window_years,
+        base_slippage=base_slippage,
+        max_drawdown_limit=max_drawdown_limit,
+        latency_base_delay=latency_base_delay,
+        latency_jitter=latency_jitter,
+        frames=frames,
+    )
+
+    qualifying = _best_qualifying_per_ticker(details.get("universe_sweep", []))
+    # Rank qualifying tickers by objective (desc) and take the top N.
+    ranked_tickers = sorted(
+        qualifying.keys(),
+        key=lambda t: qualifying[t].get("objective", -np.inf),
+        reverse=True,
+    )
+    selected = ranked_tickers[:top_n]
+
+    print(
+        f"[*] Portfolio selection: {selected or 'NONE'} "
+        f"(top {top_n} of {len(qualifying)} qualifying; weighting={weighting})"
+    )
+
+    # Step 3: per-asset daily strategy returns on the shared calendar. The
+    # MultiFactor model is the portfolio's signal engine. Dynamic slippage is
+    # approximated per-asset by the config's best sweep row's modelled cost.
+    returns_by_asset: dict = {}
+    per_asset_slippage: dict = {}
+    for ticker in selected:
+        data = frames.get(ticker)
+        if data is None or len(data) == 0:
+            continue
+        signal = apply_strategy(data, "MultiFactor")["Signal"]
+        # Volatility-scaled slippage proxy from the asset's realized vol.
+        asset_vol = (
+            data["Close"].pct_change().rolling(21).std().mean() * np.sqrt(252)
+        )
+        slip = dynamic_slippage(
+            float(asset_vol) if np.isfinite(asset_vol) else 0.15,
+            base_slippage=base_slippage,
+        )
+        per_asset_slippage[ticker] = slip
+        returns_by_asset[ticker] = daily_strategy_returns(data, signal, slippage=slip)
+
+    # Step 4: weights.
+    if weighting == "equal":
+        weights = equal_weights(list(returns_by_asset.keys()))
+    else:
+        weighting = "inverse_vol"
+        weights = inverse_volatility_weights(returns_by_asset)
+
+    # Step 5: compounded portfolio + benchmark.
+    portfolio_df = build_portfolio(returns_by_asset, weights)
+    evaluated = details.get("universe", list(frames.keys()))
+
+    if portfolio_df.empty:
+        equity_curve = []
+        port_rets = pd.Series(dtype=float)
+    else:
+        port_rets = portfolio_df["portfolio_return"]
+        equity_curve = compounded_equity_curve(port_rets)
+
+    # Benchmark: a named ticker's Buy & Hold, or an equal-weight basket.
+    bench_curve = _benchmark_curve(frames, benchmark, evaluated, port_rets)
+
+    # Headline portfolio metrics (geometric).
+    if len(port_rets):
+        pm = portfolio_metrics(port_rets)
+        n_periods = int(len(port_rets))
+        eq_series = compounded_equity_curve(port_rets)
+        cagr = geometric_cagr(eq_series, n_periods=n_periods)
+        total_ret = total_return_compounded(eq_series)
+    else:
+        pm = {"sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0}
+        cagr = 0.0
+        total_ret = 0.0
+
+    # Per-asset allocation breakdown: weight, individual Sharpe, contribution.
+    allocation = []
+    for ticker in selected:
+        if ticker not in returns_by_asset:
+            continue
+        r = returns_by_asset[ticker]
+        ind = portfolio_metrics(r)
+        asset_eq = compounded_equity_curve(r)
+        # Contribution to portfolio total return: compounded contribution column.
+        contrib_series = (
+            portfolio_df[f"contrib_{ticker}"]
+            if f"contrib_{ticker}" in portfolio_df.columns
+            else pd.Series(dtype=float)
+        )
+        contrib_pct = (
+            total_return_compounded(compounded_equity_curve(contrib_series))
+            if len(contrib_series)
+            else 0.0
+        )
+        allocation.append(
+            {
+                "ticker": ticker,
+                "weight_pct": round(weights.get(ticker, 0.0) * 100.0, 2),
+                "sharpe": round(ind["sharpe"], 3),
+                "individual_total_return_pct": round(
+                    total_return_compounded(asset_eq), 2
+                ),
+                "contribution_pct": round(contrib_pct, 2),
+                "slippage_pct": round(per_asset_slippage.get(ticker, 0.0) * 100, 5),
+            }
+        )
+
+    bench_total_return = (
+        total_return_compounded(pd.Series(bench_curve)) if len(bench_curve) else 0.0
+    )
+
+    idx = portfolio_df.index if not portfolio_df.empty else []
+    portfolio = {
+        "selected": selected,
+        "weighting": weighting,
+        "weights": {t: round(weights.get(t, 0.0), 4) for t in selected},
+        "top_n": top_n,
+        "n_qualifying": len(qualifying),
+        "equity_curve": list(equity_curve) if len(equity_curve) else [],
+        "benchmark": benchmark,
+        "benchmark_equity_curve": list(bench_curve),
+        "benchmark_total_return_pct": round(bench_total_return, 2),
+        "cagr_pct": round(cagr, 3),
+        "total_return_pct": round(total_ret, 3),
+        "sharpe": round(pm["sharpe"], 3),
+        "sortino": round(pm["sortino"], 3),
+        "max_drawdown": round(pm["max_drawdown"], 4),
+        "allocation": allocation,
+        "period_start": str(idx[0].date()) if len(idx) else None,
+        "period_end": str(idx[-1].date()) if len(idx) else None,
+        "n_periods": int(len(port_rets)),
+        "details": details,
+    }
+
+    print("\n==========================================")
+    print(" PORTFOLIO ALLOCATION RESULTS")
+    print("==========================================")
+    print(f" - Selected: {selected or 'NONE (honest empty portfolio)'}")
+    print(f" - Weighting: {weighting}")
+    if selected:
+        print(f" - Portfolio CAGR %: {portfolio['cagr_pct']}")
+        print(f" - Portfolio Total Return %: {portfolio['total_return_pct']}")
+        print(f" - Sharpe: {portfolio['sharpe']}  Sortino: {portfolio['sortino']}")
+        print(f" - Max Drawdown: {portfolio['max_drawdown']}")
+        print(f" - Benchmark ({benchmark}) Total Return %: "
+              f"{portfolio['benchmark_total_return_pct']}")
+    print("==========================================\n")
+
+    return portfolio
+
+
+def _benchmark_curve(frames, benchmark, evaluated, port_rets):
+    """Build a compounded benchmark equity curve aligned to the portfolio.
+
+    ``benchmark`` may be a ticker symbol (Buy & Hold of that asset) or
+    ``"equal_weight"`` (an equal-weight Buy & Hold basket of ``evaluated``).
+    The curve is aligned to the portfolio return index when available.
+    """
+    index = port_rets.index if len(port_rets) else None
+
+    if benchmark != "equal_weight" and benchmark in frames:
+        rets = frames[benchmark]["Close"].pct_change().fillna(0.0)
+        if index is not None:
+            rets = rets.reindex(index).fillna(0.0)
+        return list(compounded_equity_curve(rets))
+
+    # Equal-weight basket of the evaluated universe.
+    basket = [t for t in evaluated if t in frames]
+    if not basket:
+        return []
+    cols = {}
+    for t in basket:
+        r = frames[t]["Close"].pct_change().fillna(0.0)
+        if index is not None:
+            r = r.reindex(index).fillna(0.0)
+        cols[t] = r
+    basket_rets = pd.DataFrame(cols).mean(axis=1)
+    return list(compounded_equity_curve(basket_rets))
